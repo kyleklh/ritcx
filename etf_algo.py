@@ -81,6 +81,7 @@ class State:
     last_tick = -1
     last_prompt_tick = -100
     last_slow_warn = -100
+    flush_tick = 0
     arb_acc = {}          # side -> [shares, last edge], printed once per tick
 
 
@@ -426,6 +427,11 @@ def main():
             banner("NEW HEAT")
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
+        if tick != ST.flush_tick:
+            for what, (qty, edge) in ST.arb_acc.items():
+                event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
+            ST.arb_acc = {}
+            ST.flush_tick = tick
         ST.last_tick = tick
         loop_start = time.time()
         snap = snapshot()
@@ -440,9 +446,6 @@ def main():
         fx_hedge(snap)
 
         if tick != last_print:
-            for what, (qty, edge) in ST.arb_acc.items():
-                event(last_print if last_print > 0 else tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
-            ST.arb_acc = {}
             last_print = tick
             p = snap["pos"]
             u = usage(p, snap["gross_limit"], snap["net_limit"])

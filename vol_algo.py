@@ -88,6 +88,7 @@ class State:
         self.tpy = 3600
         self.last_tick = -1
         self.last_slow_warn = -100
+        self.flush_tick = 0
         self.fill_acc = {}        # (side, ticker) -> contracts, printed once per tick
         self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
 
@@ -263,13 +264,16 @@ def trade_options(info, tick, gcap):
     net = sum(o["pos"] for o in info.values())
     gross = sum(abs(o["pos"]) for o in info.values())
     # candidate trades ranked by $ edge per contract
+    # Rank by edge, but trades that CLOSE an existing position go first: when the view flips,
+    # buying back old shorts beats opening offsetting longs at a nearby strike (saves fees + limit room).
     cands = []
     for tk, o in info.items():
         if o["buy_edge"] > MIN_EDGE:
-            cands.append((o["buy_edge"], tk, "BUY"))
+            cands.append((o["pos"] < 0, o["buy_edge"], tk, "BUY"))
         if o["sell_edge"] > MIN_EDGE:
-            cands.append((o["sell_edge"], tk, "SELL"))
+            cands.append((o["pos"] > 0, o["sell_edge"], tk, "SELL"))
     cands.sort(reverse=True)
+    cands = [(edge, tk, side) for _, edge, tk, side in cands]
     traded = False
     n_orders = 0
     fills = {}
@@ -485,6 +489,9 @@ def main():
             ST.reset()
         if ST.last_tick == -1 and tick > 5:
             event(tick, "NOTE", f"joined mid-heat at tick {tick}; reading past news first")
+        if tick != ST.flush_tick:
+            flush_tick(ST.flush_tick)
+            ST.flush_tick = tick
         ST.last_tick = tick
         ST.ticks = case.get("ticks_per_period", 300)
         ST.week_len = ST.ticks // 4
@@ -522,7 +529,6 @@ def main():
         ST.force_hedge = False
 
         if tick != last_print:
-            flush_tick(last_print if last_print > 0 else tick)
             last_print = tick
             atm = min(STRIKES, key=lambda k: abs(k - S))
             atm_iv = info[CALLS[atm]]["iv"]
