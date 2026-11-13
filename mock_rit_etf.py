@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import random
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -446,7 +447,16 @@ def main():
     args = p.parse_args()
     global SIM
     SIM = Sim(args.seed, gross_limit=args.gross, net_limit=args.net)
-    server = ThreadingHTTPServer(("localhost", args.port), Handler)
+    # Listen on IPv4 AND IPv6 localhost. Windows tries IPv6 (::1) first for "localhost"; if nothing
+    # listens there it waits ~2 s per request before falling back, which makes the algos crawl.
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        class V6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+        server6 = V6Server(("::1", args.port), Handler)
+        threading.Thread(target=server6.serve_forever, daemon=True).start()
+    except OSError:
+        pass
     threading.Thread(target=run_clock, args=(args,), daemon=True).start()
     print(f"[mock] ETF mock on http://localhost:{args.port}/v1 ({args.tick}s per tick)", flush=True)
     try:

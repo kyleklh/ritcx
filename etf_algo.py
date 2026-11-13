@@ -80,6 +80,7 @@ class State:
     seen_tenders = set()
     last_tick = -1
     last_prompt_tick = -100
+    last_slow_warn = -100
     arb_acc = {}          # side -> [shares, last edge], printed once per tick
 
 
@@ -426,6 +427,7 @@ def main():
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
         ST.last_tick = tick
+        loop_start = time.time()
         snap = snapshot()
         if not snap:
             time.sleep(LOOP_SLEEP)
@@ -452,6 +454,10 @@ def main():
                 hedged = abs(p.get("BULL", 0) + r_) < 200 and abs(p.get("BEAR", 0) + r_) < 200
                 event(tick, "status", f"RITC {r_:+7,.0f}  BULL {p.get('BULL', 0):+7,.0f}  BEAR {p.get('BEAR', 0):+7,.0f}  "
                                       f"{'ok' if hedged else 'HEDGING'}  limits {u:3.0%}  P&L {nlv:+8,.0f}")
+        took = time.time() - loop_start
+        if took > 1.0 and tick - ST.last_slow_warn >= 10:
+            ST.last_slow_warn = tick
+            event(tick, "SLOW !!", f"one loop took {took:.1f}s (should be <0.5s). API is slow: check the connection")
         time.sleep(LOOP_SLEEP)
     logf.close()
     say("Stopped.")

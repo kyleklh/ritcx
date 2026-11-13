@@ -87,6 +87,7 @@ class State:
         self.week_len = 75
         self.tpy = 3600
         self.last_tick = -1
+        self.last_slow_warn = -100
         self.fill_acc = {}        # (side, ticker) -> contracts, printed once per tick
         self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
 
@@ -492,6 +493,7 @@ def main():
             time.sleep(LOOP_SLEEP)
             continue
 
+        loop_start = time.time()
         parse_news()
         sec = snapshot()
         if not sec:
@@ -533,6 +535,10 @@ def main():
                 mkt = f"{atm_iv:5.1%}" if atm_iv else "  -- "
                 event(tick, "status", f"RTM {S:6.2f}  vol {fv:5.1%} vs mkt {mkt}  net {net:+5d}  "
                                       f"delta {d:+7,.0f}  P&L {nlv:+9,.0f}")
+        took = time.time() - loop_start
+        if took > 1.0 and tick - ST.last_slow_warn >= 10:
+            ST.last_slow_warn = tick
+            event(tick, "SLOW !!", f"one loop took {took:.1f}s (should be <0.5s). API is slow: check the connection")
         time.sleep(LOOP_SLEEP)
     logf.close()
     say("Stopped.")
