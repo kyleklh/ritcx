@@ -79,7 +79,10 @@ CONVERT_STOP_BEFORE_END = 5       # no new conversions in the last N ticks
 AUTO_CONVERT_MOCK = os.environ.get("AUTO_CONVERT_MOCK") == "1" and "localhost" in API
 REPROMPT_TICKS = 4                # repeat the prompt if nothing happened after this many ticks
 
-DEFAULT_GROSS, DEFAULT_NET = 300_000, 100_000   # used if /limits is unavailable
+# The server can show a fill in /securities a moment AFTER the order returns. Until it does, the algo uses
+# its own record of the fill, so it never sends the same hedge twice (that loop caused huge USD flip-flops).
+INFLIGHT_TIMEOUT = 3.0        # seconds; after this, trust the server's position again
+DEFAULT_GROSS, DEFAULT_NET = 300_000, 200_000   # used if /limits is unavailable
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.15))
 LOG_FILE = f"etf_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
@@ -95,10 +98,12 @@ class State:
     last_detail = ""
     seen_tenders = set()
     last_tick = -1
+    acted_tick = -1
     last_prompt_tick = -100
     last_slow_warn = -100
     flush_tick = 0
     arb_acc = {}          # side -> [shares, last edge], printed once per tick
+    inflight = {}         # ticker -> {"base": position when first sent, "total": signed qty filled, "t": time}
     conv_busy_until = -1  # tick before which we don't prompt again
     conv_prompts = 0
 
@@ -129,7 +134,32 @@ def get(path, **params):
     return r.json() if r is not None and r.ok else None
 
 
-def market(ticker, action, qty):
+def note_fill(ticker, cur, signed_qty):
+    """Remember a fill until /securities shows it. cur = the position we believed before the order."""
+    if not signed_qty:
+        return
+    f = ST.inflight.get(ticker)
+    if f:
+        f["total"] += signed_qty
+        f["t"] = time.time()
+    else:
+        ST.inflight[ticker] = {"base": cur, "total": signed_qty, "t": time.time()}
+
+
+def apply_inflight(pos):
+    """Replace stale server positions with base + our fills until the server catches up (or times out)."""
+    now = time.time()
+    for tk, f in list(ST.inflight.items()):
+        unseen = f["total"] - (pos.get(tk, 0) - f["base"])
+        tol = 1000 if tk == "USD" else max(100, 0.05 * abs(f["total"]))
+        if abs(unseen) <= tol or now - f["t"] > INFLIGHT_TIMEOUT:
+            del ST.inflight[tk]
+        else:
+            pos[tk] = f["base"] + f["total"]
+
+
+def market(ticker, action, qty, cur):
+    """Market order. cur = current position (as the algo sees it), used to track the fill."""
     qty = int(qty)
     if qty <= 0:
         return 0
@@ -137,7 +167,10 @@ def market(ticker, action, qty):
     if r is None or not r.ok:
         say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120] if r is not None else 'no response'}")
         return 0
-    return int(r.json().get("quantity_filled", qty))
+    j = r.json()
+    filled = int(j.get("quantity_filled") or 0) if j.get("status") == "TRANSACTED" else qty
+    note_fill(ticker, cur, filled if action == "BUY" else -filled)
+    return filled
 
 
 # ------------------------------- market data -------------------------------
@@ -146,6 +179,7 @@ def snapshot():
     if not secs:
         return None
     pos = {x["ticker"]: float(x.get("position", 0)) for x in secs}
+    apply_inflight(pos)
     quotes = {x["ticker"]: (float(x.get("bid", 0) or 0), float(x.get("ask", 0) or 0)) for x in secs}
     books = {}
     for t in ("BULL", "BEAR", "RITC"):
@@ -300,6 +334,8 @@ def handle_tenders(snap, tick):
         if why.startswith("ok"):
             r = _req("POST", f"/tenders/{tid}")
             ok = r is not None and r.ok and r.json().get("success", True)
+            if ok:
+                note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
             event(tick, "TENDER", f"ACCEPT  {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}  ({why[4:]})"
                   + ("" if ok else "  (FAILED)"))
             if ok:
@@ -307,6 +343,8 @@ def handle_tenders(snap, tick):
         elif why.startswith("auction"):
             r = _req("POST", f"/tenders/{tid}", price=f"{bid:.2f}")
             ok = r is not None and r.ok and r.json().get("success", True)
+            if ok:
+                note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
             event(tick, "TENDER", f"BID     {desc}  our bid {bid:.2f}  -> {'WON' if ok else 'lost'}")
             if ok:
                 return True
@@ -323,7 +361,7 @@ def open_orders():
     return get("/orders", status="OPEN") or []
 
 
-def hedge(snap, tick, orders=None):
+def hedge(snap, tick, orders=None, passive=True):
     """Target BULL = BEAR = -RITC. Gap beyond URGENT_GAP -> market now. Rest -> limit order at our best price."""
     pos, bk, q = effective_pos(snap), snap["books"], snap["q"]
     target = -pos.get("RITC", 0)
@@ -346,12 +384,16 @@ def hedge(snap, tick, orders=None):
         if urgent >= HEDGE_MIN:
             levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
             avail = max(levels[0][1] if levels else 0, depth_within(levels, HEDGE_SLIP))
-            f = market(leg, side, min(urgent, MAX_EQ_ORDER, avail))
+            f = market(leg, side, min(urgent, MAX_EQ_ORDER, avail), pos.get(leg, 0))
             if f:
                 pos[leg] = pos.get(leg, 0) + (f if side == "BUY" else -f)
                 gap += -f if side == "BUY" else f
                 did = True
-        # 2) passive part: one resting order at the best bid (buy) / best ask (sell)
+        # 2) passive part: one resting order at the best bid (buy) / best ask (sell).
+        #    Only once per tick: a resting order's fills can show in /securities late, and re-sizing
+        #    it several times per tick on a stale position stacks orders and overshoots the hedge.
+        if not passive:
+            continue
         mine = [o for o in orders if o["ticker"] == leg]
         want_qty = abs(gap) if abs(gap) >= HEDGE_MIN else 0
         bid, ask = q[leg]
@@ -395,7 +437,7 @@ def arb(snap, tick):
     if sell_etf > (ARB_CLOSE_EDGE if r > 0 else ARB_OPEN_EDGE):
         qty = min(size, r) if r > 0 else min(size, ARB_MAX_PAIRS + r)
         if qty >= 100 and usage(pos, gl, nl, d_ritc=-qty, d_bull=qty, d_bear=qty) <= LIMIT_USAGE_MAX:
-            f = market("RITC", "SELL", qty)
+            f = market("RITC", "SELL", qty, r)
             pos["RITC"] = r - f
             if f:
                 a = ST.arb_acc.setdefault("SELL RITC / buy basket", [0, 0])
@@ -408,7 +450,7 @@ def arb(snap, tick):
     if buy_etf > (ARB_CLOSE_EDGE if r < 0 else ARB_OPEN_EDGE):
         qty = min(size, -r) if r < 0 else min(size, ARB_MAX_PAIRS - r)
         if qty >= 100 and usage(pos, gl, nl, d_ritc=qty, d_bull=-qty, d_bear=-qty) <= LIMIT_USAGE_MAX:
-            f = market("RITC", "BUY", qty)
+            f = market("RITC", "BUY", qty, r)
             pos["RITC"] = r + f
             if f:
                 a = ST.arb_acc.setdefault("BUY RITC / sell basket", [0, 0])
@@ -420,11 +462,13 @@ def arb(snap, tick):
 
 # ------------------------------- 4. FX -------------------------------
 def fx_hedge(snap):
+    if "USD" in ST.inflight or "RITC" in ST.inflight:
+        return            # the USD cash from those trades may not show yet: wait instead of guessing
     usd = snap["pos"].get("USD", 0)
     if abs(usd) <= FX_BAND:
         return
     qty = min(MAX_FX_ORDER, int(abs(usd)))
-    market("USD", "SELL" if usd > 0 else "BUY", qty)
+    market("USD", "SELL" if usd > 0 else "BUY", qty, usd)
 
 
 # ------------------------------- 5. converters -------------------------------
@@ -494,7 +538,7 @@ def main():
             banner("NEW HEAT")
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
-            ST.conv_busy_until, ST.conv_prompts = -1, 0
+            ST.conv_busy_until, ST.conv_prompts, ST.inflight = -1, 0, {}
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -510,10 +554,13 @@ def main():
         if handle_tenders(snap, tick):
             snap = snapshot_at(tick, ticks) or snap
         converters(snap, tick)
-        hedge(snap, tick)
+        first_of_tick = tick != ST.acted_tick      # slow decisions (resting orders, FX) once per tick
+        ST.acted_tick = tick
+        hedge(snap, tick, passive=first_of_tick)
         if arb(snap, tick):
-            hedge(snap, tick)
-        fx_hedge(snap)
+            hedge(snap, tick, passive=False)
+        if first_of_tick:
+            fx_hedge(snap)
 
         if tick != last_print:
             last_print = tick

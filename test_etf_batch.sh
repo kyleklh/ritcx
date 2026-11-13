@@ -5,7 +5,7 @@ N=${1:-6}; FIRST=${2:-1}
 cd "$(dirname "$0")"; mkdir -p test
 for i in $(seq 0 $((N-1))); do
   seed=$((FIRST+i)); port=$((9800+i))
-  python3 mock_rit_etf.py --port $port --tick 0.2 --seed $seed --start-delay 1 > test/etfmock_$seed.out 2>&1 &
+  python3 mock_rit_etf.py --port $port --tick 0.2 --seed $seed --start-delay 1 $MOCK_ARGS > test/etfmock_$seed.out 2>&1 &
   echo $! >> test/etfpids
 done
 sleep 0.5

@@ -40,7 +40,7 @@ CONVERT_COST_USD = 1500.0
 class Sim:
     def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=200_000,
                  depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0,
-                 tender_min=70_000, tender_max=100_000):
+                 tender_min=70_000, tender_max=100_000, pos_lag=0.0):
         self.rng = random.Random(seed)
         r = self.rng
         self.ticks = ticks
@@ -72,6 +72,9 @@ class Sim:
         self.tender_id = 0
         self.tender_log = []
         self.tender_min, self.tender_max = tender_min, tender_max
+        # Reported positions lag the real ones by pos_lag seconds (the real server can be slow to show fills)
+        self.pos_lag = pos_lag
+        self.pos_hist = []        # (time, copy of positions) after every change
         # converters: each use takes CONVERT_TICKS; inputs leave at the start, outputs arrive at the end
         self.conv = {"redeem": {"busy_until": 0, "outputs": None}, "create": {"busy_until": 0, "outputs": None}}
         self.conversions = 0
@@ -135,17 +138,39 @@ class Sim:
         g, n = self.gross_net(pos)
         return g <= self.gross_limit and abs(n) <= self.net_limit
 
+    def _record(self):
+        if self.pos_lag > 0:
+            now = time.time()
+            self.pos_hist.append((now, dict(self.pos)))
+            while len(self.pos_hist) > 2 and self.pos_hist[1][0] <= now - self.pos_lag:
+                self.pos_hist.pop(0)
+
+    def reported_pos(self):
+        """Positions as the API shows them: pos_lag seconds old."""
+        if self.pos_lag <= 0 or not self.pos_hist:
+            return self.pos
+        cutoff = time.time() - self.pos_lag
+        seen = None
+        for t, p in self.pos_hist:
+            if t <= cutoff:
+                seen = p
+        return seen if seen is not None else self.pos_hist[0][1]
+
     def _apply_fill(self, t, side, q, px, fee_per_share):
         """side +1 buy, -1 sell. Cash: RITC settles in USD, others in CAD."""
+        if self.pos_lag > 0 and not self.pos_hist:
+            self.pos_hist.append((0.0, dict(self.pos)))
         self.pos[t] += side * q
         if t == "USD":
             self.pos["CAD"] -= side * q * px
+            self._record()
             return
         ccy = "USD" if t == "RITC" else "CAD"
         self.pos[ccy] -= side * q * px
         self.pos[ccy] -= fee_per_share * q
         self.fees += fee_per_share * q * (self.F["USD"] if ccy == "USD" else 1.0)
         self.last[t] = px
+        self._record()
 
     # ---------- simulation ----------
     def step(self):
@@ -261,6 +286,7 @@ class Sim:
                 self.pos[k] -= v
             self.fees += ins["USD"] * self.F["USD"]
             c["busy_until"], c["outputs"] = self.tick + self.CONVERT_TICKS, dict(outs)
+            self._record()
             self.conversions += 1
             return 200, {"success": True, "kind": kind, "quantity": qty, "done_tick": c["busy_until"]}
 
@@ -277,6 +303,7 @@ class Sim:
                 for k, v in c["outputs"].items():
                     self.pos[k] += v
                 c["outputs"] = None
+                self._record()
 
     def _close_out(self):
         self.open_orders.clear()
@@ -340,19 +367,20 @@ class Sim:
 
     def securities(self):
         out = []
+        pos = self.reported_pos()
         for t in TICKERS:
             if t == "CAD":
-                out.append({"ticker": "CAD", "position": round(self.pos["CAD"], 2), "bid": 1, "ask": 1, "last": 1,
+                out.append({"ticker": "CAD", "position": round(pos["CAD"], 2), "bid": 1, "ask": 1, "last": 1,
                             "bid_size": 0, "ask_size": 0})
                 continue
             bid, ask = self.best(t)
-            out.append({"ticker": t, "position": round(self.pos[t], 2), "bid": bid, "ask": ask,
+            out.append({"ticker": t, "position": round(pos[t], 2), "bid": bid, "ask": ask,
                         "last": round(self.last.get(t, self.mid(t)), 4), "bid_size": self.depth[t],
                         "ask_size": self.depth[t]})
         return out
 
     def limits(self):
-        g, n = self.gross_net(self.pos)
+        g, n = self.gross_net(self.reported_pos())
         return [{"name": "LIMIT-STOCK", "gross": g, "net": n, "gross_limit": self.gross_limit,
                  "net_limit": self.net_limit, "gross_fine": 0, "net_fine": 0}]
 
@@ -447,7 +475,7 @@ def run_clock(args):
     while True:
         SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net, depth_mult=args.depth_mult,
                   vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult,
-                  tender_min=args.tender_min, tender_max=args.tender_max)
+                  tender_min=args.tender_min, tender_max=args.tender_max, pos_lag=args.pos_lag)
         print(f"[mock] new heat, seed={seed}", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -474,6 +502,7 @@ def main():
     p.add_argument("--gift-mean", type=float, default=0.10, help="average tender discount vs fair (USD/share)")
     p.add_argument("--shock-mult", type=float, default=1.0, help="size of RITC-vs-basket shocks")
     p.add_argument("--start-delay", type=float, default=2.0)
+    p.add_argument("--pos-lag", type=float, default=0.0, help="seconds the reported positions lag real fills")
     p.add_argument("--loop", action="store_true")
     args = p.parse_args()
     global SIM
