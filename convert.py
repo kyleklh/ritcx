@@ -2,9 +2,10 @@
 Usage: python convert.py redeem [quantity]    or    python convert.py create [quantity]   (blocks of 10,000)"""
 import sys
 import requests
+from config import API_KEY
 
 kind = sys.argv[1] if len(sys.argv) > 1 else "redeem"
 qty = int(sys.argv[2]) if len(sys.argv) > 2 else 10000
 r = requests.post("http://localhost:9999/v1/mock/convert", params={"kind": kind, "quantity": qty},
-                  headers={"X-API-Key": "Rotman"})
+                  headers={"X-API-Key": API_KEY})
 print(r.status_code, r.text)

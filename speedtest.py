@@ -3,10 +3,11 @@ Each call should take well under 50 ms. If 'localhost' is ~2000 ms but 127.0.0.1
 Windows IPv6 delay: update the mock (git pull) or use API = "http://127.0.0.1:9999/v1" for the MOCK only."""
 import time
 import requests
+from config import API_KEY
 
 for host in ("localhost", "127.0.0.1"):
     s = requests.Session()
-    s.headers.update({"X-API-Key": "Rotman"})
+    s.headers.update({"X-API-Key": API_KEY})
     times = []
     for _ in range(5):
         t = time.time()

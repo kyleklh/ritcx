@@ -33,10 +33,23 @@ Batch test, 8 heats at 5x speed (about 70 seconds):
 ./test_batch.sh 8 1
 ```
 
+### Your API key (once per computer)
+
+The RIT Client generates its own API key (click **API** at the bottom right). Put it in a file named `.env`
+in this folder so you never have to edit the scripts:
+
+```bash
+copy .env.example .env
+```
+
+then open `.env` and set `RIT_API_KEY=` to the key the client shows. `.env` is ignored by git, so your
+key stays on your computer. Each teammate does this with their own key. All scripts
+(`vol_algo.py`, `etf_algo.py`, `speedtest.py`, `convert.py`) read it automatically.
+
 ### On competition day
 
-1. Open the RIT Client, log in, enable the API (check port and API key in the client).
-2. Set `API` / `API_KEY` at the top of `vol_algo.py` if they differ from `localhost:9999` / `Rotman`.
+1. Open the RIT Client, log in, enable the API.
+2. Check `.env` has the key the client shows (and `RIT_API` if the port isn't 9999).
 3. Start `python vol_algo.py` before tick 1. Each teammate runs it on their own account.
 
 Live commands (type + Enter):

@@ -30,8 +30,7 @@ import requests
 from display import say, event, banner
 
 # =========================== SETTINGS (tune between heats) ===========================
-API = os.environ.get("RIT_API", "http://localhost:9999/v1")
-API_KEY = "Rotman"
+from config import API, API_KEY   # read from .env (see .env.example); defaults to localhost:9999 / Rotman
 
 FEE = 0.02                    # market order fee per share
 MAX_EQ_ORDER = 10000

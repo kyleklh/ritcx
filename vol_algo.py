@@ -33,8 +33,7 @@ import bs
 from display import say, event, banner
 
 # =========================== SETTINGS (tune between heats) ===========================
-API = os.environ.get("RIT_API", "http://localhost:9999/v1")
-API_KEY = "Rotman"
+from config import API, API_KEY   # read from .env (see .env.example); defaults to localhost:9999 / Rotman
 
 STRIKES = [48, 49, 50, 51, 52]
 RISK_FREE = 0.0
