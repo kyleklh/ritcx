@@ -45,7 +45,7 @@ def parse_option(t):
 
 
 class Sim:
-    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None):
+    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0):
         self.rng = random.Random(seed)
         self.tick_seconds = tick_seconds
         self.ticks = ticks
@@ -54,7 +54,15 @@ class Sim:
         self.half_life = half_life
         self.lock = threading.Lock()
         self.true_vols = [round(self.rng.uniform(0.15, 0.40), 2) for _ in range(4)]
-        self.mm_vol = mm_start if mm_start is not None else 0.25
+        # scenario knobs use their own RNG so the price path for a seed stays the same across scenarios
+        alt = random.Random(None if seed is None else seed + 1_000_000)
+        self.alt = alt
+        self.range_miss = range_miss
+        if mm_start is None:
+            mm_start = 0.25
+        elif mm_start < 0:                      # random starting guess for the market maker
+            mm_start = round(alt.uniform(0.15, 0.40), 3)
+        self.mm_vol = mm_start
         self.S = 50.0
         self.tick = 0
         self.status = "ACTIVE"
@@ -124,6 +132,9 @@ class Sim:
             if self.tick == start + self.week_len // 2 and w < 4:
                 nv = self.true_vols[w] * 100
                 lo = round(nv - self.rng.uniform(0, 3))
+                if self.alt.random() < self.range_miss:      # forecast range that MISSES the true vol
+                    miss = self.alt.uniform(1, 3)          # true vol lies 1-3 points outside the range
+                    lo = round(nv + miss) if self.alt.random() < 0.5 else round(nv - 3 - miss)
                 self._add_news(f"Week {w + 1} volatility forecast",
                                f"The realized volatility of RTM for next week will be between {lo}% and {lo + 3}%")
             # CRO delta penalty
@@ -266,7 +277,7 @@ def run_clock(args):
     global SIM
     seed = args.seed
     while True:
-        SIM = Sim(args.tick, seed, half_life=args.half_life)
+        SIM = Sim(args.tick, seed, half_life=args.half_life, mm_start=args.mm_start, range_miss=args.range_miss)
         print(f"[mock] new heat, seed={seed}. (true vols hidden; printed at the end)", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -284,6 +295,8 @@ def main():
     p.add_argument("--tick", type=float, default=1.0, help="seconds per tick (1.0 = real speed)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--half-life", type=float, default=20.0, help="ticks for market maker to close half the vol gap")
+    p.add_argument("--mm-start", type=float, default=None, help="market maker's starting vol (-1 = random 15-40%%)")
+    p.add_argument("--range-miss", type=float, default=0.0, help="probability a forecast range misses the true vol")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true", help="start a new heat after each one ends")
     args = p.parse_args()
