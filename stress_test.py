@@ -38,7 +38,7 @@ def run_batch(seeds, mock_args, env_extra, parallel=8):
         time.sleep(0.5)
         for j, seed in enumerate(chunk):
             env = dict(os.environ, RIT_API=f"http://localhost:{9500 + j}/v1", LOOP_SLEEP="0.05", **env_extra)
-            algos.append(subprocess.Popen([sys.executable, "vol_algo.py"], cwd=os.path.join(HERE, "test"), env=env,
+            algos.append(subprocess.Popen([sys.executable, os.path.join(HERE, "vol_algo.py")], cwd=os.path.join(HERE, "test"), env=env,
                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         time.sleep(68)
         for a in algos:
@@ -70,6 +70,8 @@ def main():
             for seed, pnl, fees, pen in res:
                 rows.append({"scenario": name, "GAMMA_Z": z, "seed": seed, "pnl": pnl, "fees": fees, "penalty": pen})
             ok = [r[1] for r in res if r[1] is not None]
+            if ok and all(x == 0 for x in ok):
+                sys.exit("All heats ended at exactly 0: the algo probably failed to start. Aborting.")
             print(f"{name:<30} Z={z}: mean {statistics.mean(ok):>9,.0f}  min {min(ok):>9,.0f}  "
                   f"losing {sum(x < 0 for x in ok)}/{len(ok)}", flush=True)
     with open(os.path.join(HERE, "test", "stress_results.csv"), "w", newline="") as f:

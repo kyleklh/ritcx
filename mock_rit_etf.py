@@ -36,7 +36,8 @@ CONVERT_COST_USD = 1500.0
 
 
 class Sim:
-    def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=100_000):
+    def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=100_000,
+                 depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0):
         self.rng = random.Random(seed)
         r = self.rng
         self.ticks = ticks
@@ -46,7 +47,8 @@ class Sim:
         self.gross_limit, self.net_limit = gross_limit, net_limit
         # fair values
         self.F = {"BULL": 10.0, "BEAR": 15.0, "USD": 1.00}
-        self.vol = {"BULL": 0.015, "BEAR": 0.02, "USD": 0.0004}
+        self.vol = {"BULL": 0.015 * vol_mult, "BEAR": 0.02 * vol_mult, "USD": 0.0004 * vol_mult}
+        self.gift_mean, self.shock_mult = gift_mean, shock_mult
         self.shock = 0.0                       # RITC deviation from basket fair (USD)
         self.shock_decay = 0.93
         # market microstructure (per heat randomness)
@@ -55,7 +57,8 @@ class Sim:
         self.depth = {"BULL": r.choice([2000, 3000, 4000]), "BEAR": r.choice([2000, 3000, 4000]),
                       "RITC": r.choice([1000, 1500, 2000]), "USD": 1_000_000}
         self.disp = {t: 0.0 for t in ["BULL", "BEAR", "RITC", "USD"]}   # temporary price impact
-        self.flow = {"BULL": 3000, "BEAR": 3000, "RITC": 2000, "USD": 500_000}
+        self.depth = {k: max(100, int(v * depth_mult)) for k, v in self.depth.items()}
+        self.flow = {k: int(v * flow_mult) for k, v in {"BULL": 3000, "BEAR": 3000, "RITC": 2000, "USD": 500_000}.items()}
         # account
         self.pos = {t: 0 for t in TICKERS}     # USD/CAD positions = cash balances
         self.fees = 0.0
@@ -152,7 +155,7 @@ class Sim:
             # ETF shocks
             self.shock *= self.shock_decay
             if r.random() < 0.04:
-                self.shock += r.choice([-1, 1]) * r.uniform(0.08, 0.30)
+                self.shock += r.choice([-1, 1]) * r.uniform(0.08, 0.30) * self.shock_mult
             self._fill_limit_orders()
             self._tenders()
             if self.tick >= self.ticks:
@@ -194,7 +197,7 @@ class Sim:
             qty = r.choice([10000, 20000, 25000, 30000, 40000, 50000])
             fair = self.ritc_fair()
             # positive = good for us; sometimes a trap
-            gift = r.gauss(0.10, 0.10)
+            gift = r.gauss(self.gift_mean, 0.10)
             fixed = r.random() < 0.75
             px = round(fair - gift if action == "BUY" else fair + gift, 2)
             tdr = {"tender_id": self.tender_id, "period": 1, "tick": self.tick, "expires": self.tick + 12,
@@ -423,7 +426,8 @@ def run_clock(args):
     global SIM
     seed = args.seed
     while True:
-        SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net)
+        SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net, depth_mult=args.depth_mult,
+                  vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult)
         print(f"[mock] new heat, seed={seed}", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -442,6 +446,11 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--gross", type=int, default=300_000)
     p.add_argument("--net", type=int, default=100_000)
+    p.add_argument("--depth-mult", type=float, default=1.0, help="order book depth multiplier")
+    p.add_argument("--vol-mult", type=float, default=1.0, help="price volatility multiplier")
+    p.add_argument("--flow-mult", type=float, default=1.0, help="how fast resting limit orders get filled")
+    p.add_argument("--gift-mean", type=float, default=0.10, help="average tender discount vs fair (USD/share)")
+    p.add_argument("--shock-mult", type=float, default=1.0, help="size of RITC-vs-basket shocks")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true")
     args = p.parse_args()
