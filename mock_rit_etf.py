@@ -9,10 +9,9 @@ Approximates the case so you can develop without practice-server access:
   - Market fee $0.02/share. Max order 10,000 (equities). RITC counts 2x for limits.
   - Private tender offers (fixed price, and some competitive auctions) for RITC
   - Close-out at end at the CORRECT price (RITC valued at (BULL+BEAR)/USD)
-  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000), two ways:
-      * the RIT lease API: POST /leases?ticker=ETF-Redemption, then POST /leases/{id}?from1=RITC&quantity1=10000&...
-        (each use takes 2 ticks; inputs leave at the start, outputs arrive at the end)
-      * a MOCK-ONLY instant endpoint standing in for the manual click: python convert.py redeem
+  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000). In the competition they are HUMAN ONLY
+    (clicked in the RIT Client). Here a MOCK-ONLY endpoint stands in for that click:
+    python convert.py redeem   (each use takes 2 ticks; inputs leave at the start, outputs arrive at the end)
   - Limits and tender sizes match the practice-server reports: gross 300k, net 200k, tenders 70k-100k
 
 Depth, spreads, tender discounts and shocks are still guesses.
@@ -73,10 +72,8 @@ class Sim:
         self.tender_id = 0
         self.tender_log = []
         self.tender_min, self.tender_max = tender_min, tender_max
-        # converters (RIT "refinery" assets): lease once, then each use takes CONVERT_TICKS.
-        # Inputs leave at the start of a use, outputs arrive when it completes (one use at a time).
-        self.leases = {}          # ticker -> {"id", "ticker", "busy_until", "outputs"}
-        self.lease_seq = 0
+        # converters: each use takes CONVERT_TICKS; inputs leave at the start, outputs arrive at the end
+        self.conv = {"redeem": {"busy_until": 0, "outputs": None}, "create": {"busy_until": 0, "outputs": None}}
         self.conversions = 0
         self.last = {t: self.mid(t) for t in ["BULL", "BEAR", "RITC", "USD"]}
 
@@ -250,74 +247,36 @@ class Sim:
             return 200, {"success": True}
 
     def convert(self, kind, qty):
+        """One converter use (10,000), like clicking it in the RIT Client."""
         with self.lock:
-            if qty % 10000 or qty <= 0:
-                return 400, {"code": "INVALID", "message": "Converters work in blocks of 10,000"}
-            n = qty // 10000
-            tmp = dict(self.pos)
-            if kind == "redeem":
-                tmp["RITC"] -= qty
-                tmp["BULL"] += qty
-                tmp["BEAR"] += qty
-            elif kind == "create":
-                tmp["RITC"] += qty
-                tmp["BULL"] -= qty
-                tmp["BEAR"] -= qty
-            else:
+            if kind not in self.RECIPES:
                 return 400, {"code": "INVALID", "message": "kind must be redeem or create"}
-            self.pos = tmp
-            self.pos["USD"] -= CONVERT_COST_USD * n
-            self.fees += CONVERT_COST_USD * n * self.F["USD"]
-            return 200, {"success": True, "kind": kind, "quantity": qty}
-
-    # ---------- leases (converters via the API) ----------
-    LEASE_RECIPES = {
-        "ETF-Redemption": ({"RITC": 10000, "USD": 1500}, {"BULL": 10000, "BEAR": 10000}),
-        "ETF-Creation": ({"BULL": 10000, "BEAR": 10000, "USD": 1500}, {"RITC": 10000}),
-    }
-    CONVERT_TICKS = 2
-
-    def _lease_view(self, L):
-        return {"id": L["id"], "ticker": L["ticker"], "type": "REFINERY",
-                "convert_finish_tick": L["busy_until"] if L["busy_until"] > self.tick else None}
-
-    def lease(self, ticker):
-        with self.lock:
-            if ticker not in self.LEASE_RECIPES:
-                return 400, {"code": "INVALID", "message": f"Unknown asset {ticker}"}
-            if ticker not in self.leases:
-                self.lease_seq += 1
-                self.leases[ticker] = {"id": self.lease_seq, "ticker": ticker, "busy_until": 0, "outputs": None}
-            return 200, self._lease_view(self.leases[ticker])
-
-    def use_lease(self, lid, params):
-        with self.lock:
-            L = next((x for x in self.leases.values() if x["id"] == lid), None)
-            if not L:
-                return 404, {"code": "NOT_FOUND", "message": "No such lease"}
-            if L["busy_until"] > self.tick:
-                return 400, {"code": "INVALID", "message": "Asset is busy"}
-            ins, outs = self.LEASE_RECIPES[L["ticker"]]
-            given = {}
-            for i in (1, 2, 3):
-                if f"from{i}" in params:
-                    given[params[f"from{i}"]] = float(params.get(f"quantity{i}", 0))
-            if given != {k: float(v) for k, v in ins.items()}:
-                return 400, {"code": "INVALID", "message": f"Inputs must be {ins}"}
+            if qty != 10000:
+                return 400, {"code": "INVALID", "message": "One use converts exactly 10,000"}
+            c = self.conv[kind]
+            if c["busy_until"] > self.tick:
+                return 400, {"code": "INVALID", "message": "Converter is busy"}
+            ins, outs = self.RECIPES[kind]
             for k, v in ins.items():
                 self.pos[k] -= v
             self.fees += ins["USD"] * self.F["USD"]
-            L["busy_until"] = self.tick + self.CONVERT_TICKS
-            L["outputs"] = dict(outs)
+            c["busy_until"], c["outputs"] = self.tick + self.CONVERT_TICKS, dict(outs)
             self.conversions += 1
-            return 200, self._lease_view(L)
+            return 200, {"success": True, "kind": kind, "quantity": qty, "done_tick": c["busy_until"]}
+
+    # ---------- converters (stand-in for the human click) ----------
+    RECIPES = {
+        "redeem": ({"RITC": 10000, "USD": 1500}, {"BULL": 10000, "BEAR": 10000}),
+        "create": ({"BULL": 10000, "BEAR": 10000, "USD": 1500}, {"RITC": 10000}),
+    }
+    CONVERT_TICKS = 2
 
     def _finish_conversions(self):
-        for L in self.leases.values():
-            if L["outputs"] and self.tick >= L["busy_until"]:
-                for k, v in L["outputs"].items():
+        for c in self.conv.values():
+            if c["outputs"] and self.tick >= c["busy_until"]:
+                for k, v in c["outputs"].items():
                     self.pos[k] += v
-                L["outputs"] = None
+                c["outputs"] = None
 
     def _close_out(self):
         self.open_orders.clear()
@@ -450,8 +409,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, [o for o in s.orders if o["status"] == st])
             if path == "/v1/news":
                 return self._send(200, [])
-            if path == "/v1/leases":
-                return self._send(200, [s._lease_view(L) for L in s.leases.values()])
         self._send(404, {"code": "NOT_FOUND", "message": path})
 
     def do_POST(self):
@@ -469,10 +426,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(*SIM.accept_tender(int(path.rsplit("/", 1)[1]), q.get("price")))
         if path == "/v1/commands/cancel":
             return self._send(*SIM.cancel(ticker=q.get("ticker")))
-        if path == "/v1/leases":
-            return self._send(*SIM.lease(q.get("ticker", "")))
-        if path.startswith("/v1/leases/"):
-            return self._send(*SIM.use_lease(int(path.rsplit("/", 1)[1]), q))
         if path == "/v1/mock/convert":
             return self._send(*SIM.convert(q.get("kind", ""), int(q.get("quantity", 10000))))
         self._send(404, {"code": "NOT_FOUND", "message": path})

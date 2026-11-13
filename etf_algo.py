@@ -14,8 +14,9 @@ converges for free at the end. Profit comes from the price at which we enter the
   5. CONVERTERS: tenders (70k-100k RITC) are too big to hedge with stock alone, because a hedged
      share uses 4 units of gross (RITC counts 2x). So we accept the tender, hedge what fits, and
      redeem/create hedged 10k blocks: each block cancels RITC against BULL+BEAR and frees 40k of
-     gross for the next part of the hedge. Done through the lease API when the server allows it,
-     otherwise the algo prints "CONVERTER: REDEEM 1 x 10,000 NOW" for you to click.
+     gross for the next part of the hedge. The case rules say converters are HUMAN ONLY: the algo
+     never calls a converter/lease endpoint on the real server. It prints
+     ">>> CONVERTER: REDEEM 1 x 10,000 NOW" and you click it in the RIT Client Assets tab.
 
 Live commands (type + Enter):  p / r  pause / resume tenders+arb (hedging continues)
                                s      status        q  quit
@@ -72,8 +73,11 @@ CONVERT_FEE_USD = 1500            # per block
 CONVERT_TICKS = 2                 # one use takes this many ticks; one use at a time
 CONVERT_TARGET = 0.90             # convert hedged blocks until the fully hedged book fits under this usage
 CONVERT_STOP_BEFORE_END = 5       # no new conversions in the last N ticks
-AUTO_CONVERT = os.environ.get("AUTO_CONVERT", "1") == "1"   # use the lease API; falls back to prompts if it fails
-MANUAL_REPROMPT_TICKS = 4         # manual mode: repeat the prompt if the position hasn't changed after this
+# Converters are HUMAN ONLY in the competition (case rules): the algo only PRINTS a prompt.
+# AUTO_CONVERT_MOCK=1 makes it "click" through the fake server's /mock/convert endpoint, which exists only
+# in mock_rit_etf.py, and only when RIT_API points at localhost. It can never reach a real converter.
+AUTO_CONVERT_MOCK = os.environ.get("AUTO_CONVERT_MOCK") == "1" and "localhost" in API
+REPROMPT_TICKS = 4                # repeat the prompt if nothing happened after this many ticks
 
 DEFAULT_GROSS, DEFAULT_NET = 300_000, 100_000   # used if /limits is unavailable
 STATUS_EVERY = 5              # print a status line every N ticks
@@ -95,11 +99,8 @@ class State:
     last_slow_warn = -100
     flush_tick = 0
     arb_acc = {}          # side -> [shares, last edge], printed once per tick
-    auto_convert = AUTO_CONVERT
-    leases = {}           # "redeem"/"create" -> lease id
-    conv_busy_until = -1  # tick when the converter in use is free again
-    conv_pending = {}     # outputs not yet delivered (only if the server takes inputs at the start)
-    conv_done = 0
+    conv_busy_until = -1  # tick before which we don't prompt again
+    conv_prompts = 0
 
 
 ST = State()
@@ -428,84 +429,31 @@ def fx_hedge(snap):
 
 # ------------------------------- 5. converters -------------------------------
 def effective_pos(snap):
-    """Positions including converter outputs that are on their way (if the server takes inputs first)."""
-    if not ST.conv_pending:
-        return snap["pos"]
-    p = dict(snap["pos"])
-    for k, v in ST.conv_pending.items():
-        p[k] = p.get(k, 0) + v
-    return p
-
-
-def _lease(kind):
-    """Lease id for "redeem"/"create" (leased once per heat; the lease lasts the whole case)."""
-    if kind in ST.leases:
-        return ST.leases[kind]
-    ticker = "ETF-Redemption" if kind == "redeem" else "ETF-Creation"
-    for L in get("/leases") or []:
-        if L.get("ticker") == ticker:
-            ST.leases[kind] = L["id"]
-            return L["id"]
-    r = _req("POST", "/leases", ticker=ticker)
-    if r is not None and r.ok and "id" in r.json():
-        ST.leases[kind] = r.json()["id"]
-        return ST.leases[kind]
-    say(f"[converter] could not lease {ticker}: {r.text[:120] if r is not None else 'no response'}")
-    return None
-
-
-def _use_lease(kind):
-    lid = _lease(kind)
-    if lid is None:
-        return False
-    if kind == "redeem":
-        params = {"from1": "RITC", "quantity1": CONVERT_BLOCK, "from2": "USD", "quantity2": CONVERT_FEE_USD}
-    else:
-        params = {"from1": "BULL", "quantity1": CONVERT_BLOCK, "from2": "BEAR", "quantity2": CONVERT_BLOCK,
-                  "from3": "USD", "quantity3": CONVERT_FEE_USD}
-    r = _req("POST", f"/leases/{lid}", **params)
-    if r is None or not r.ok:
-        say(f"[converter] use failed: {r.text[:160] if r is not None else 'no response'}")
-        return False
-    return True
+    return snap["pos"]
 
 
 def converters(snap, tick):
-    """Redeem/create one hedged 10k block at a time while the fully hedged book doesn't fit in our limits."""
+    """Ask the HUMAN to redeem/create one hedged 10k block at a time while the fully hedged book
+    doesn't fit in our limits. The algo itself never touches the converters (case rules)."""
     ticks_total = snap.get("ticks", 300)
-    if tick >= ST.conv_busy_until and ST.conv_pending:
-        ST.conv_pending = {}                         # outputs have arrived
     if tick < ST.conv_busy_until or tick > ticks_total - CONVERT_STOP_BEFORE_END:
         return
-    pos, gl, nl = effective_pos(snap), snap["gross_limit"], snap["net_limit"]
-    if blocks_to_convert(pos, gl, nl) == 0:
+    pos, gl, nl = snap["pos"], snap["gross_limit"], snap["net_limit"]
+    need = blocks_to_convert(pos, gl, nl)
+    if need == 0:
         return
     r = pos.get("RITC", 0)
     sgn = 1 if r > 0 else -1
     hedged = min(abs(r), max(0.0, -sgn * pos.get("BULL", 0)), max(0.0, -sgn * pos.get("BEAR", 0)))
     if hedged < CONVERT_BLOCK:
         return                                       # hedge the next block first
-    kind = "redeem" if r > 0 else "create"
-    if ST.auto_convert:
-        watch = "RITC" if kind == "redeem" else "BULL"          # an input of this conversion
-        before = {x["ticker"]: float(x.get("position", 0)) for x in (get("/securities") or [])}.get(watch)
-        if _use_lease(kind):
-            ST.conv_done += 1
-            ST.conv_busy_until = tick + CONVERT_TICKS
-            after = {x["ticker"]: float(x.get("position", 0)) for x in (get("/securities") or [])}.get(watch)
-            # If the inputs left already, the outputs are "pending" until the converter finishes.
-            # (If the server swaps everything at the end instead, nothing is pending.)
-            if before is not None and after is not None and abs(after - before) >= CONVERT_BLOCK * 0.99:
-                ST.conv_pending = ({"BULL": CONVERT_BLOCK, "BEAR": CONVERT_BLOCK} if kind == "redeem"
-                                   else {"RITC": CONVERT_BLOCK})
-            event(tick, "CONVERT", f"{kind.upper()} 1 x 10,000 (#{ST.conv_done}, fee ${CONVERT_FEE_USD:,} USD)")
-            return
-        ST.auto_convert = False
-        banner("CONVERTER API NOT AVAILABLE: switching to manual prompts.\n"
-               "Click ETF-Redemption / ETF-Creation in the RIT Client Assets tab when asked.")
-    banner(f">>> CONVERTER: {kind.upper()} 1 x 10,000 NOW  (Assets tab -> "
-           f"ETF-{'Redemption' if kind == 'redeem' else 'Creation'})")
-    ST.conv_busy_until = tick + MANUAL_REPROMPT_TICKS
+    kind = "REDEEM" if r > 0 else "CREATE"
+    ST.conv_prompts += 1
+    banner(f">>> CONVERTER: {kind} 1 x 10,000 NOW  (Assets tab -> "
+           f"ETF-{'Redemption' if kind == 'REDEEM' else 'Creation'})   [{need} block{'s' if need > 1 else ''} still needed]")
+    if AUTO_CONVERT_MOCK:
+        _req("POST", "/mock/convert", kind=kind.lower(), quantity=CONVERT_BLOCK)
+    ST.conv_busy_until = tick + REPROMPT_TICKS
 
 
 # ------------------------------- console -------------------------------
@@ -546,7 +494,7 @@ def main():
             banner("NEW HEAT")
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
-            ST.leases, ST.conv_busy_until, ST.conv_pending, ST.conv_done = {}, -1, {}, 0
+            ST.conv_busy_until, ST.conv_prompts = -1, 0
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")

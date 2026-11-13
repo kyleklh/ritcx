@@ -7,8 +7,8 @@
 | `bs.py` | Black-Scholes price, delta, gamma, vega, implied vol (no extra packages). |
 | `test_batch.sh` | Runs the vol algo against many fast mock heats and prints each P&L. |
 | `etf_algo.py` | ETF arbitrage algorithm. Settings are at the top. |
-| `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters via the lease API). |
-| `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client. |
+| `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters). |
+| `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client (talks to the fake server only). |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
 
 ## Volatility case
@@ -117,23 +117,21 @@ Batch test, 6 heats at 5x speed:
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
-5. **Converters**: while the fully hedged book would not fit under `CONVERT_TARGET` usage, it redeems
-   (long RITC) or creates (short RITC) one hedged 10k block at a time, through the RIT lease API
-   (`POST /leases`, then `POST /leases/{id}`). If the server refuses the API calls, it prints
-   `>>> CONVERTER: REDEEM 1 x 10,000 NOW <<<` instead, and you click it in the RIT Client.
-   Set `AUTO_CONVERT=0` to always use prompts.
+5. **Converters (human only)**: the case rules say the algo may NOT use the converters, so it never calls
+   them. While the fully hedged book would not fit under `CONVERT_TARGET` usage, it prints
+   `>>> CONVERTER: REDEEM 1 x 10,000 NOW` (long RITC) or `CREATE` (short RITC), and you click that converter
+   in the RIT Client Assets tab. One click per prompt; each use takes 2 ticks.
 
 ### Operator during the heat
 
-- Watch for `CONVERT` lines. If you see `CONVERTER API NOT AVAILABLE`, click ETF-Redemption / ETF-Creation
-  in the RIT Client Assets tab each time a `>>> CONVERTER` prompt appears (one 10k block per prompt).
+- Before the heat: lease ETF-Redemption and ETF-Creation in the Assets tab (free, lasts the whole heat).
+- When a `>>> CONVERTER` prompt appears, click Use on that converter once. The prompt repeats every few ticks
+  while more blocks are needed.
 - Watch `limits=` and check that BULL and BEAR stay equal to -RITC.
 - `p` / `r` to pause / resume tenders and arb (hedging continues). `s` for status, `q` to quit.
 
 ### Check once you have practice-server access
 
-- [ ] Whether the lease API works for the converters (look for `CONVERT` vs `CONVERTER API NOT AVAILABLE`).
-- [ ] Whether a conversion takes its inputs at the start or swaps everything at the end (the algo detects this).
 - [ ] How deep the books are and how fast passive orders fill (tune `URGENT_GAP`, `TENDER_MIN_EDGE`).
 - [ ] Whether the USD position really is USD cash (the FX hedge assumes it is).
 - [ ] Tender fields (`is_fixed_bid`, `price`, `action`) match what the algo expects.
