@@ -3,3 +3,4 @@ __pycache__/
 vol_log_*.csv
 etf_log_*.csv
 *.pyc
+news_raw_*.txt
