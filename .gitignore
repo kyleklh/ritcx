@@ -1,0 +1,4 @@
+test/
+__pycache__/
+vol_log_*.csv
+*.pyc
