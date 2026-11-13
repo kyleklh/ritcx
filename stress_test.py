@@ -64,9 +64,15 @@ def main():
     os.makedirs(os.path.join(HERE, "test"), exist_ok=True)
     seeds = list(range(a.first_seed, a.first_seed + a.heats))
     rows = []
+    only = os.environ.get("ONLY_SCENARIO")
     for name, margs in SCENARIOS.items():
+        if only and not name.startswith(only):
+            continue
         for z in a.z.split(","):
-            res = run_batch(seeds, margs, {"GAMMA_Z": z})
+            extra = {"GAMMA_Z": z}
+            if os.environ.get("REVERSE_EDGE"):
+                extra["REVERSE_EDGE"] = os.environ["REVERSE_EDGE"]
+            res = run_batch(seeds, margs, extra)
             for seed, pnl, fees, pen in res:
                 rows.append({"scenario": name, "GAMMA_Z": z, "seed": seed, "pnl": pnl, "fees": fees, "penalty": pen})
             ok = [r[1] for r in res if r[1] is not None]

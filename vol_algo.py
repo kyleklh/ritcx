@@ -41,7 +41,7 @@ RISK_FREE = 0.0
 
 OPT_FEE_PER_SHARE = 0.02      # $2 per contract / 100 shares
 MIN_EDGE = 0.02               # extra $/share of mispricing required beyond fees (safety margin)
-REVERSE_EDGE = 0.10           # edge needed to flip the book's direction (long<->short): a flip pays the
+REVERSE_EDGE = float(os.environ.get("REVERSE_EDGE", 0.10))          # edge needed to flip the book's direction (long<->short): a flip pays the
                               # ~$3/contract round trip twice, so small vol wobbles shouldn't trigger it.
                               # The "direction" is remembered until the book has been flat for a while, so
                               # closing shorts and then opening longs at a small edge still counts as a flip.
@@ -269,11 +269,6 @@ def quick_hedge(tick, d):
     return d
 
 
-def side_opens_against_book(side):
-    """True when opening on this side goes against the book's remembered direction (a reversal)."""
-    return (side == "BUY" and ST.book_dir < 0) or (side == "SELL" and ST.book_dir > 0)
-
-
 def trade_options(info, tick, gcap):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
@@ -325,8 +320,6 @@ def trade_options(info, tick, gcap):
             closing = (side == "BUY" and pos < 0) or (side == "SELL" and pos > 0)
             if closing:
                 q = min(q, abs(pos)) if q > 0 else 0
-            elif pos == 0 and side_opens_against_book(side):
-                break   # this strike is now flat; reopening the other way is a reversal, re-judged next pass
             if q <= 0 or (q < MIN_OPEN_QTY and not closing):
                 break
             filled = place(tk, side, q)
