@@ -1,13 +1,19 @@
-# RITCx prep: Volatility Trading Case
+# RITCx prep
 
 | File | What it is |
 |---|---|
 | `vol_algo.py` | The trading algorithm. Settings are at the top. |
 | `mock_rit_vol.py` | Local fake RIT server for practising without server access. |
 | `bs.py` | Black-Scholes price, delta, gamma, vega, implied vol (no extra packages). |
-| `test_batch.sh` | Runs the algo against many fast mock heats and prints each P&L. |
+| `test_batch.sh` | Runs the vol algo against many fast mock heats and prints each P&L. |
+| `etf_algo.py` | ETF arbitrage algorithm. Settings are at the top. |
+| `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX). |
+| `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client. |
+| `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
 
-## Practise locally (no RIT access needed)
+## Volatility case
+
+### Practise locally (no RIT access needed)
 
 Terminal 1 (real speed, 1 tick per second):
 
@@ -27,7 +33,7 @@ Batch test, 8 heats at 5x speed (about 70 seconds):
 ./test_batch.sh 8 1
 ```
 
-## On competition day
+### On competition day
 
 1. Open the RIT Client, log in, enable the API (check port and API key in the client).
 2. Set `API` / `API_KEY` at the top of `vol_algo.py` if they differ from `localhost:9999` / `Rotman`.
@@ -42,7 +48,7 @@ Live commands (type + Enter):
 - `s`: show status
 - `q`: quit
 
-## What the algo does
+### What the algo does
 
 1. Parses news for this week's vol and next week's range.
 2. Fair vol = sqrt(time-weighted variance over the remaining life).
@@ -53,8 +59,61 @@ Live commands (type + Enter):
    - Book gamma capped (`GAMMA_Z`) so a single tick move cannot breach the 7000 limit.
 5. Closes all options in the last `CLOSE_TICKS_BEFORE_END` ticks.
 
-## Check once you have practice-server access
+### Check once you have practice-server access
 
 - [ ] Exact wording of the vol news (the parser expects "will be 20%" and "between 27% and 30%").
 - [ ] How fast the market maker's implied vol catches up (the mock assumes a half-life of 20 ticks).
 - [ ] Whether the case is 300 ticks (the algo reads `ticks_per_period` automatically).
+
+## ETF Arbitrage case
+
+### Practise locally
+
+Terminal 1:
+
+```bash
+python mock_rit_etf.py --loop
+```
+
+Terminal 2:
+
+```bash
+python etf_algo.py
+```
+
+Batch test, 6 heats at 5x speed:
+
+```bash
+./test_etf_batch.sh 6 1
+```
+
+### What the algo does
+
+1. **Tenders**: values each one against the basket it can actually trade.
+   - Up to `URGENT_GAP` shares are hedged passively, near mid plus the rebate.
+   - The rest is valued by walking the book at market.
+   - Accepts if the edge is at least `TENDER_MIN_EDGE` per share and the limits stay below 90%.
+   - Auction tenders get a bid priced to keep that edge.
+2. **Hedge**: keeps BULL = BEAR = -RITC.
+   - Limit orders at the best price first (earning the $0.01 rebate).
+   - Market orders only for the part of the gap beyond `URGENT_GAP`.
+3. **Arb**: trades RITC when RITC vs the basket is mispriced beyond fees; the hedge adds the basket legs.
+   - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
+   - Capped at `ARB_MAX_PAIRS` to keep limit room for tenders.
+4. **FX**: keeps the USD cash position near 0.
+5. **Converters**: prints `>>> CONVERTER: REDEEM/CREATE ... <<<` only when a profitable tender was declined
+   because of limits. Holding hedged pairs to the end is free, since close-out happens at the correct price,
+   so converting otherwise just costs $1,500.
+
+### Operator during the heat
+
+- Watch for `>>> CONVERTER` lines and click ETF-Redemption / ETF-Creation in the RIT Client Assets tab.
+- Watch `limits=` and check that BULL and BEAR stay equal to -RITC.
+- `p` / `r` to pause / resume tenders and arb (hedging continues). `s` for status, `q` to quit.
+
+### Check once you have practice-server access
+
+- [ ] Real gross/net limits (read from `/limits`) and typical tender sizes.
+- [ ] How deep the books are and how fast passive orders fill (tune `URGENT_GAP`, `TENDER_MIN_EDGE`).
+- [ ] Whether the USD position really is USD cash (the FX hedge assumes it is).
+- [ ] Tender fields (`is_fixed_bid`, `price`, `action`) match what the algo expects.

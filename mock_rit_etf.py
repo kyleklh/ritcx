@@ -1,0 +1,459 @@
+"""
+Local mock of the RIT REST API for the RITCx Algorithmic ETF Arbitrage Case.
+
+Approximates the case so you can develop without practice-server access:
+  - BULL, BEAR (CAD), RITC (USD), USD (CAD per USD), CAD
+  - Equilibrium: RITC * USD = BULL + BEAR, plus periodic ETF shocks that decay
+  - Order books with LIMITED depth: market orders walk the book and push the price (impact decays)
+  - Limit orders rest and fill when other traders' flow hits them (rebate $0.01)
+  - Market fee $0.02/share. Max order 10,000 (equities). RITC counts 2x for limits.
+  - Private tender offers (fixed price, and some competitive auctions) for RITC
+  - Close-out at end at the CORRECT price (RITC valued at (BULL+BEAR)/USD)
+  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000) via a MOCK-ONLY endpoint,
+    standing in for the manual click in the RIT Client: python convert.py redeem
+
+All numbers (depth, spreads, tender sizes, limits) are guesses. Tune them to match the practice server.
+
+Usage:
+    python mock_rit_etf.py                 # real speed (1 tick per second)
+    python mock_rit_etf.py --tick 0.2 --seed 3 --loop
+"""
+import argparse
+import json
+import math
+import random
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+EQUITIES = ["BULL", "BEAR", "RITC"]
+TICKERS = ["CAD", "USD", "BULL", "BEAR", "RITC"]
+FEE_MKT, REBATE_LMT = 0.02, 0.01
+MAX_ORDER = {"BULL": 10000, "BEAR": 10000, "RITC": 10000, "USD": 2_500_000, "CAD": 2_500_000}
+CONVERT_COST_USD = 1500.0
+
+
+class Sim:
+    def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=100_000):
+        self.rng = random.Random(seed)
+        r = self.rng
+        self.ticks = ticks
+        self.tick = 0
+        self.status = "ACTIVE"
+        self.lock = threading.Lock()
+        self.gross_limit, self.net_limit = gross_limit, net_limit
+        # fair values
+        self.F = {"BULL": 10.0, "BEAR": 15.0, "USD": 1.00}
+        self.vol = {"BULL": 0.015, "BEAR": 0.02, "USD": 0.0004}
+        self.shock = 0.0                       # RITC deviation from basket fair (USD)
+        self.shock_decay = 0.93
+        # market microstructure (per heat randomness)
+        self.half_spread = {"BULL": 0.01, "BEAR": 0.01, "RITC": 0.01, "USD": 0.0001}
+        self.level_step = {"BULL": 0.01, "BEAR": 0.01, "RITC": 0.01, "USD": 0.0001}
+        self.depth = {"BULL": r.choice([2000, 3000, 4000]), "BEAR": r.choice([2000, 3000, 4000]),
+                      "RITC": r.choice([1000, 1500, 2000]), "USD": 1_000_000}
+        self.disp = {t: 0.0 for t in ["BULL", "BEAR", "RITC", "USD"]}   # temporary price impact
+        self.flow = {"BULL": 3000, "BEAR": 3000, "RITC": 2000, "USD": 500_000}
+        # account
+        self.pos = {t: 0 for t in TICKERS}     # USD/CAD positions = cash balances
+        self.fees = 0.0
+        self.orders = []
+        self.open_orders = {}
+        self.tenders = []
+        self.next_tender_tick = r.randint(5, 15)
+        self.tender_id = 0
+        self.tender_log = []
+        self.last = {t: self.mid(t) for t in ["BULL", "BEAR", "RITC", "USD"]}
+
+    # ---------- prices ----------
+    def ritc_fair(self):
+        return (self.F["BULL"] + self.F["BEAR"]) / self.F["USD"]
+
+    def mid(self, t):
+        if t == "CAD":
+            return 1.0
+        if t == "RITC":
+            return self.ritc_fair() + self.shock + self.disp["RITC"]
+        return self.F[t] + self.disp[t]
+
+    def best(self, t):
+        m, hs = self.mid(t), self.half_spread[t]
+        dec = 4 if t == "USD" else 2
+        return round(m - hs, dec), round(m + hs, dec)
+
+    def book(self, t, levels=20):
+        bid, ask = self.best(t)
+        st, d = self.level_step[t], self.depth[t]
+        dec = 4 if t == "USD" else 2
+        bids = [{"price": round(bid - i * st, dec), "quantity": d, "quantity_filled": 0} for i in range(levels)]
+        asks = [{"price": round(ask + i * st, dec), "quantity": d, "quantity_filled": 0} for i in range(levels)]
+        # show our resting orders in the book too
+        for o in self.open_orders.values():
+            if o["ticker"] == t:
+                (bids if o["action"] == "BUY" else asks).append(
+                    {"price": o["price"], "quantity": o["quantity"] - o["quantity_filled"], "quantity_filled": 0,
+                     "trader_id": "mock"})
+        bids.sort(key=lambda x: -x["price"])
+        asks.sort(key=lambda x: x["price"])
+        return {"bids": bids, "asks": asks}
+
+    def _walk(self, t, side, q):
+        """Fill q against the book. Returns vwap and moves the price (impact)."""
+        bid, ask = self.best(t)
+        st, d = self.level_step[t], self.depth[t]
+        start = ask if side > 0 else bid
+        remaining, cost, i = q, 0.0, 0
+        while remaining > 0:
+            take = min(d, remaining)
+            cost += take * (start + side * i * st)
+            remaining -= take
+            i += 1
+        vwap = cost / q
+        # impact: price moves by levels consumed, partly persistent
+        self.disp[t] += side * (q / d) * st * 0.6
+        return vwap
+
+    # ---------- limits ----------
+    def gross_net(self, pos):
+        g = abs(pos["BULL"]) + abs(pos["BEAR"]) + 2 * abs(pos["RITC"])
+        n = pos["BULL"] + pos["BEAR"] + 2 * pos["RITC"]
+        return g, n
+
+    def within_limits(self, pos):
+        g, n = self.gross_net(pos)
+        return g <= self.gross_limit and abs(n) <= self.net_limit
+
+    def _apply_fill(self, t, side, q, px, fee_per_share):
+        """side +1 buy, -1 sell. Cash: RITC settles in USD, others in CAD."""
+        self.pos[t] += side * q
+        if t == "USD":
+            self.pos["CAD"] -= side * q * px
+            return
+        ccy = "USD" if t == "RITC" else "CAD"
+        self.pos[ccy] -= side * q * px
+        self.pos[ccy] -= fee_per_share * q
+        self.fees += fee_per_share * q * (self.F["USD"] if ccy == "USD" else 1.0)
+        self.last[t] = px
+
+    # ---------- simulation ----------
+    def step(self):
+        with self.lock:
+            if self.status != "ACTIVE":
+                return
+            self.tick += 1
+            r = self.rng
+            for t in ("BULL", "BEAR"):
+                self.F[t] = max(1.0, self.F[t] + r.gauss(0, self.vol[t]))
+            self.F["USD"] *= (1 + r.gauss(0, self.vol["USD"]))
+            for t in self.disp:
+                self.disp[t] *= 0.75
+            # ETF shocks
+            self.shock *= self.shock_decay
+            if r.random() < 0.04:
+                self.shock += r.choice([-1, 1]) * r.uniform(0.08, 0.30)
+            self._fill_limit_orders()
+            self._tenders()
+            if self.tick >= self.ticks:
+                self._close_out()
+
+    def _fill_limit_orders(self):
+        r = self.rng
+        for oid in list(self.open_orders):
+            o = self.open_orders[oid]
+            t = o["ticker"]
+            bid, ask = self.best(t)
+            side = 1 if o["action"] == "BUY" else -1
+            rem = o["quantity"] - o["quantity_filled"]
+            # marketable after price move -> fill now
+            if (side > 0 and o["price"] >= ask) or (side < 0 and o["price"] <= bid):
+                q = rem
+            elif (side > 0 and o["price"] >= bid) or (side < 0 and o["price"] <= ask):
+                q = min(rem, int(r.uniform(0, self.flow[t]))) if r.random() < 0.6 else 0
+            else:
+                q = 0
+            if q > 0:
+                tmp = dict(self.pos)
+                tmp[t] += side * q
+                if t in EQUITIES and not self.within_limits(tmp):
+                    continue
+                self._apply_fill(t, side, q, o["price"], -REBATE_LMT if t in EQUITIES else 0.0)
+                o["quantity_filled"] += q
+                if o["quantity_filled"] >= o["quantity"]:
+                    o["status"] = "TRANSACTED"
+                    del self.open_orders[oid]
+
+    def _tenders(self):
+        r = self.rng
+        self.tenders = [x for x in self.tenders if x["expires"] > self.tick]
+        if self.tick >= self.next_tender_tick and self.tick < self.ticks - 15:
+            self.next_tender_tick = self.tick + r.randint(15, 30)
+            self.tender_id += 1
+            action = r.choice(["BUY", "SELL"])
+            qty = r.choice([10000, 20000, 25000, 30000, 40000, 50000])
+            fair = self.ritc_fair()
+            # positive = good for us; sometimes a trap
+            gift = r.gauss(0.10, 0.10)
+            fixed = r.random() < 0.75
+            px = round(fair - gift if action == "BUY" else fair + gift, 2)
+            tdr = {"tender_id": self.tender_id, "period": 1, "tick": self.tick, "expires": self.tick + 12,
+                   "caption": f"Institution wants you to {action} {qty} RITC", "quantity": qty,
+                   "ticker": "RITC", "action": action, "is_fixed_bid": fixed,
+                   "price": px if fixed else None}
+            tdr["_reserve"] = px
+            self.tenders.append(tdr)
+
+    def accept_tender(self, tid, price):
+        with self.lock:
+            tdr = next((x for x in self.tenders if x["tender_id"] == tid), None)
+            if not tdr:
+                return 404, {"code": "NOT_FOUND", "message": "No such tender"}
+            side = 1 if tdr["action"] == "BUY" else -1
+            if tdr["is_fixed_bid"]:
+                px = tdr["price"]
+            else:
+                if price is None:
+                    return 400, {"code": "INVALID", "message": "Price required for auction tender"}
+                px = float(price)
+                ok = px <= tdr["_reserve"] if side > 0 else px >= tdr["_reserve"]
+                self.tenders.remove(tdr)
+                if not ok:
+                    return 200, {"success": False}
+            tmp = dict(self.pos)
+            tmp["RITC"] += side * tdr["quantity"]
+            if not self.within_limits(tmp):
+                return 400, {"code": "INVALID", "message": "Accepting would exceed limits"}
+            self._apply_fill("RITC", side, tdr["quantity"], px, 0.0)
+            if tdr in self.tenders:
+                self.tenders.remove(tdr)
+            self.tender_log.append((tdr["tick"], tdr["action"], tdr["quantity"], px, round(self.ritc_fair(), 3)))
+            return 200, {"success": True}
+
+    def decline_tender(self, tid):
+        with self.lock:
+            self.tenders = [x for x in self.tenders if x["tender_id"] != tid]
+            return 200, {"success": True}
+
+    def convert(self, kind, qty):
+        with self.lock:
+            if qty % 10000 or qty <= 0:
+                return 400, {"code": "INVALID", "message": "Converters work in blocks of 10,000"}
+            n = qty // 10000
+            tmp = dict(self.pos)
+            if kind == "redeem":
+                tmp["RITC"] -= qty
+                tmp["BULL"] += qty
+                tmp["BEAR"] += qty
+            elif kind == "create":
+                tmp["RITC"] += qty
+                tmp["BULL"] -= qty
+                tmp["BEAR"] -= qty
+            else:
+                return 400, {"code": "INVALID", "message": "kind must be redeem or create"}
+            self.pos = tmp
+            self.pos["USD"] -= CONVERT_COST_USD * n
+            self.fees += CONVERT_COST_USD * n * self.F["USD"]
+            return 200, {"success": True, "kind": kind, "quantity": qty}
+
+    def _close_out(self):
+        self.open_orders.clear()
+        u = self.F["USD"]
+        cad = self.pos["CAD"] + self.pos["BULL"] * self.F["BULL"] + self.pos["BEAR"] * self.F["BEAR"]
+        usd = self.pos["USD"] + self.pos["RITC"] * self.ritc_fair()
+        self.final_nlv = cad + usd * u
+        self.status = "STOPPED"
+        print(f"[mock] heat over. P&L={self.final_nlv:,.2f} CAD  (fees+converters {self.fees:,.2f}, "
+              f"depth {self.depth}, tenders accepted {len(self.tender_log)})", flush=True)
+
+    def nlv(self):
+        if self.status == "STOPPED":
+            return self.final_nlv
+        u = self.mid("USD")
+        v = self.pos["CAD"] + self.pos["BULL"] * self.mid("BULL") + self.pos["BEAR"] * self.mid("BEAR")
+        v += (self.pos["USD"] + self.pos["RITC"] * self.mid("RITC")) * u
+        return v
+
+    # ---------- orders ----------
+    def order(self, t, action, qty, otype, price):
+        with self.lock:
+            if self.status != "ACTIVE":
+                return 400, {"code": "INVALID", "message": "Case is not active"}
+            if t not in ("BULL", "BEAR", "RITC", "USD"):
+                return 400, {"code": "INVALID", "message": "Not tradeable"}
+            if qty <= 0 or qty > MAX_ORDER[t]:
+                return 400, {"code": "INVALID", "message": f"Quantity must be 1..{MAX_ORDER[t]}"}
+            side = 1 if action == "BUY" else -1
+            if t in EQUITIES:
+                tmp = dict(self.pos)
+                tmp[t] += side * qty
+                if not self.within_limits(tmp):
+                    return 400, {"code": "INVALID", "message": "Order would exceed trading limits"}
+            oid = len(self.orders) + 1
+            bid, ask = self.best(t)
+            marketable = otype == "MARKET" or (side > 0 and price >= ask) or (side < 0 and price <= bid)
+            if marketable:
+                vwap = self._walk(t, side, qty)
+                if otype == "LIMIT" and ((side > 0 and vwap > price) or (side < 0 and vwap < price)):
+                    vwap = price
+                self._apply_fill(t, side, qty, vwap, FEE_MKT if t in EQUITIES else 0.0)
+                o = {"order_id": oid, "tick": self.tick, "ticker": t, "type": otype, "quantity": qty,
+                     "action": action, "price": price, "quantity_filled": qty, "vwap": round(vwap, 4),
+                     "status": "TRANSACTED"}
+            else:
+                o = {"order_id": oid, "tick": self.tick, "ticker": t, "type": "LIMIT", "quantity": qty,
+                     "action": action, "price": price, "quantity_filled": 0, "vwap": None, "status": "OPEN"}
+                self.open_orders[oid] = o
+            self.orders.append(o)
+            return 200, o
+
+    def cancel(self, oid=None, ticker=None):
+        with self.lock:
+            ids = [oid] if oid else [k for k, o in self.open_orders.items() if ticker in (None, o["ticker"])]
+            for k in ids:
+                o = self.open_orders.pop(k, None)
+                if o:
+                    o["status"] = "CANCELLED"
+            return 200, {"cancelled_order_ids": ids}
+
+    def securities(self):
+        out = []
+        for t in TICKERS:
+            if t == "CAD":
+                out.append({"ticker": "CAD", "position": round(self.pos["CAD"], 2), "bid": 1, "ask": 1, "last": 1,
+                            "bid_size": 0, "ask_size": 0})
+                continue
+            bid, ask = self.best(t)
+            out.append({"ticker": t, "position": round(self.pos[t], 2), "bid": bid, "ask": ask,
+                        "last": round(self.last.get(t, self.mid(t)), 4), "bid_size": self.depth[t],
+                        "ask_size": self.depth[t]})
+        return out
+
+    def limits(self):
+        g, n = self.gross_net(self.pos)
+        return [{"name": "LIMIT-STOCK", "gross": g, "net": n, "gross_limit": self.gross_limit,
+                 "net_limit": self.net_limit, "gross_fine": 0, "net_fine": 0}]
+
+
+SIM = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _q(self):
+        u = urlparse(self.path)
+        return u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
+
+    def _auth(self):
+        if (self.headers.get("X-API-Key") or self.headers.get("X-API-key")) != "Rotman":
+            self._send(401, {"code": "UNAUTHORIZED", "message": "Bad API key"})
+            return False
+        return True
+
+    def do_GET(self):
+        if not self._auth():
+            return
+        path, q = self._q()
+        s = SIM
+        with s.lock:
+            if path == "/v1/case":
+                return self._send(200, {"name": "ETF Arbitrage (mock)", "period": 1, "tick": s.tick,
+                                        "ticks_per_period": s.ticks, "total_periods": 1, "status": s.status})
+            if path == "/v1/trader":
+                return self._send(200, {"trader_id": "mock", "nlv": round(s.nlv(), 2)})
+            if path == "/v1/securities":
+                secs = s.securities()
+                if "ticker" in q:
+                    secs = [x for x in secs if x["ticker"] == q["ticker"]]
+                return self._send(200, secs)
+            if path == "/v1/securities/book":
+                return self._send(200, s.book(q.get("ticker", "RITC"), int(q.get("limit", 20))))
+            if path == "/v1/tenders":
+                return self._send(200, [{k: v for k, v in x.items() if not k.startswith("_")} for x in s.tenders])
+            if path == "/v1/limits":
+                return self._send(200, s.limits())
+            if path == "/v1/orders":
+                st = q.get("status", "OPEN")
+                return self._send(200, [o for o in s.orders if o["status"] == st])
+            if path == "/v1/news":
+                return self._send(200, [])
+        self._send(404, {"code": "NOT_FOUND", "message": path})
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        path, q = self._q()
+        if path == "/v1/orders":
+            price = float(q["price"]) if "price" in q else None
+            otype = q.get("type", "MARKET").upper()
+            if otype == "LIMIT" and price is None:
+                return self._send(400, {"code": "INVALID", "message": "LIMIT needs price"})
+            return self._send(*SIM.order(q.get("ticker"), q.get("action", "").upper(),
+                                         int(float(q.get("quantity", 0))), otype, price))
+        if path.startswith("/v1/tenders/"):
+            return self._send(*SIM.accept_tender(int(path.rsplit("/", 1)[1]), q.get("price")))
+        if path == "/v1/commands/cancel":
+            return self._send(*SIM.cancel(ticker=q.get("ticker")))
+        if path == "/v1/mock/convert":
+            return self._send(*SIM.convert(q.get("kind", ""), int(q.get("quantity", 10000))))
+        self._send(404, {"code": "NOT_FOUND", "message": path})
+
+    def do_DELETE(self):
+        if not self._auth():
+            return
+        path, q = self._q()
+        if path.startswith("/v1/tenders/"):
+            return self._send(*SIM.decline_tender(int(path.rsplit("/", 1)[1])))
+        if path.startswith("/v1/orders/"):
+            return self._send(*SIM.cancel(oid=int(path.rsplit("/", 1)[1])))
+        self._send(404, {"code": "NOT_FOUND", "message": path})
+
+
+def run_clock(args):
+    global SIM
+    seed = args.seed
+    while True:
+        SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net)
+        print(f"[mock] new heat, seed={seed}", flush=True)
+        time.sleep(args.start_delay)
+        while SIM.status == "ACTIVE":
+            time.sleep(args.tick)
+            SIM.step()
+        if not args.loop:
+            return
+        time.sleep(args.start_delay)
+        seed = None if seed is None else seed + 1
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, default=9999)
+    p.add_argument("--tick", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--gross", type=int, default=300_000)
+    p.add_argument("--net", type=int, default=100_000)
+    p.add_argument("--start-delay", type=float, default=2.0)
+    p.add_argument("--loop", action="store_true")
+    args = p.parse_args()
+    global SIM
+    SIM = Sim(args.seed, gross_limit=args.gross, net_limit=args.net)
+    server = ThreadingHTTPServer(("localhost", args.port), Handler)
+    threading.Thread(target=run_clock, args=(args,), daemon=True).start()
+    print(f"[mock] ETF mock on http://localhost:{args.port}/v1 ({args.tick}s per tick)", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

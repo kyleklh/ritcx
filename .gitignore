@@ -1,4 +1,5 @@
 test/
 __pycache__/
 vol_log_*.csv
+etf_log_*.csv
 *.pyc
