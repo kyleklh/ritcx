@@ -27,6 +27,8 @@ from datetime import datetime
 
 import requests
 
+from display import say, event, banner
+
 # =========================== SETTINGS (tune between heats) ===========================
 API = os.environ.get("RIT_API", "http://localhost:9999/v1")
 API_KEY = "Rotman"
@@ -63,6 +65,7 @@ CONVERT_COST_USD = 1500 / 10000   # per share
 AUTO_CONVERT_MOCK = os.environ.get("AUTO_CONVERT_MOCK") == "1"   # mock testing only
 
 DEFAULT_GROSS, DEFAULT_NET = 300_000, 100_000   # used if /limits is unavailable
+STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.15))
 LOG_FILE = f"etf_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
 # =====================================================================================
@@ -77,6 +80,7 @@ class State:
     seen_tenders = set()
     last_tick = -1
     last_prompt_tick = -100
+    arb_acc = {}          # side -> [shares, last edge], printed once per tick
 
 
 ST = State()
@@ -95,7 +99,7 @@ def _req(method, path, **params):
                 continue
             return r
         except requests.RequestException as e:
-            print(f"[warn] {method} {path}: {e}")
+            say(f"[warn] {method} {path}: {e}")
             time.sleep(0.2)
     return None
 
@@ -111,7 +115,7 @@ def market(ticker, action, qty):
         return 0
     r = _req("POST", "/orders", ticker=ticker, type="MARKET", quantity=qty, action=action)
     if r is None or not r.ok:
-        print(f"[order rejected] {action} {qty} {ticker}: {r.text[:120] if r is not None else 'no response'}")
+        say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120] if r is not None else 'no response'}")
         return 0
     return int(r.json().get("quantity_filled", qty))
 
@@ -231,26 +235,26 @@ def handle_tenders(snap, tick):
             continue
         ST.seen_tenders.add(tid)
         if ST.paused:
-            print(f"\n[TENDER {tid}] paused -> ignoring")
+            event(tick, "TENDER", f"#{tid} ignored (paused)")
             continue
         edge, bid, why = evaluate_tender(t, snap)
         q, act, px = t["quantity"], t["action"], t.get("price")
-        desc = f"{act} {q:,} RITC @ {px if px is not None else 'AUCTION'}"
+        desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
         if why == "ok":
             r = _req("POST", f"/tenders/{tid}")
             ok = r is not None and r.ok and r.json().get("success", True)
-            print(f"\n[TENDER {tid} t={tick}] ACCEPT {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}  -> {ok}")
+            event(tick, "TENDER", f"ACCEPT  {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}" + ("" if ok else "  (FAILED)"))
             if ok:
                 return True
         elif why == "auction":
             r = _req("POST", f"/tenders/{tid}", price=f"{bid:.2f}")
             ok = r is not None and r.ok and r.json().get("success", True)
-            print(f"\n[TENDER {tid} t={tick}] AUCTION {desc}: bid {bid:.2f} (keeps {TENDER_MIN_EDGE}/sh) -> {ok}")
+            event(tick, "TENDER", f"BID     {desc}  our bid {bid:.2f}  -> {'WON' if ok else 'lost'}")
             if ok:
                 return True
         else:
             _req("DELETE", f"/tenders/{tid}")
-            print(f"\n[TENDER {tid} t={tick}] DECLINE {desc}  edge {edge:+.3f}/sh  ({why})")
+            event(tick, "TENDER", f"decline {desc}  edge {edge:+.3f}/sh  ({why})")
             if why.startswith("limits") and edge >= TENDER_MIN_EDGE and edge * q >= TENDER_MIN_PROFIT:
                 converter_prompt(t, edge, snap, tick)
     return False
@@ -325,7 +329,9 @@ def arb(snap, tick):
             f = market("RITC", "SELL", qty)
             pos["RITC"] = r - f
             if f:
-                print(f"\n  t={tick} ARB sell {f} RITC / buy basket, edge {sell_etf:+.3f}")
+                a = ST.arb_acc.setdefault("SELL RITC / buy basket", [0, 0])
+                a[0] += f
+                a[1] = sell_etf
             return f > 0
     size = min(ARB_CLIP, bk["RITC"]["asks"][0][1] if bk["RITC"]["asks"] else 0,
                bk["BULL"]["bids"][0][1] if bk["BULL"]["bids"] else 0,
@@ -336,7 +342,9 @@ def arb(snap, tick):
             f = market("RITC", "BUY", qty)
             pos["RITC"] = r + f
             if f:
-                print(f"\n  t={tick} ARB buy {f} RITC / sell basket, edge {buy_etf:+.3f}")
+                a = ST.arb_acc.setdefault("BUY RITC / sell basket", [0, 0])
+                a[0] += f
+                a[1] = buy_etf
             return f > 0
     return False
 
@@ -359,7 +367,7 @@ def converter_prompt(t, edge, snap, tick):
     r = pos.get("RITC", 0)
     blocks_held = int(abs(r) // 10000)
     if blocks_held == 0:
-        print(f">>> CONVERTER would not help: no 10k pair blocks held <<<")
+        event(tick, "CONVERT", "would not help: no 10k pair blocks held")
         return
     gl = snap["gross_limit"]
     side = 1 if t["action"] == "BUY" else -1
@@ -371,8 +379,8 @@ def converter_prompt(t, edge, snap, tick):
     gain = edge * t["quantity"]
     kind = "REDEEM" if r > 0 else "CREATE"
     if gain > cost_cad * 1.5:
-        print(f"\n>>> CONVERTER: {kind} {n} x 10,000 NOW, then the next similar tender fits. "
-              f"Tender was worth ${gain:,.0f} vs converter cost ${cost_cad:,.0f} <<<")
+        banner(f">>> CONVERTER: {kind} {n} x 10,000 NOW  (Assets tab -> ETF-{'Redemption' if kind == 'REDEEM' else 'Creation'})\n"
+               f">>> Declined tender was worth ${gain:,.0f}; converting costs ${cost_cad:,.0f}")
         if AUTO_CONVERT_MOCK:
             for _ in range(n):
                 _req("POST", "/mock/convert", kind=kind.lower(), quantity=10000)
@@ -385,14 +393,14 @@ def console():
         c = line.strip().lower()
         if c == "p":
             ST.paused = True
-            print("[paused] no tenders/arb; hedging continues")
+            say("[paused] no tenders/arb; hedging continues")
         elif c == "r":
             ST.paused = False
-            print("[resumed]")
+            say("[resumed]")
         elif c == "s":
             snap = snapshot()
             if snap:
-                print(f"[status] pos={ {k: round(v) for k, v in snap['pos'].items()} } "
+                say(f"[status] pos={ {k: round(v) for k, v in snap['pos'].items()} } "
                       f"usage={usage(snap['pos'], snap['gross_limit'], snap['net_limit']):.0%}")
         elif c == "q":
             ST.quit = True
@@ -402,7 +410,7 @@ def console():
 # ------------------------------- main -------------------------------
 def main():
     threading.Thread(target=console, daemon=True).start()
-    print("ETF algo waiting for ACTIVE case...  (p/r/s/q + Enter)")
+    banner("ETF ALGO  |  waiting for the case to start\nCommands (type + Enter): p pause | r resume | s status | q quit")
     logf = open(LOG_FILE, "w", newline="")
     log = csv.writer(logf)
     log.writerow(["tick", "BULL", "BEAR", "RITC", "USD", "usage", "nlv"])
@@ -414,7 +422,7 @@ def main():
             continue
         tick = case["tick"]
         if tick < ST.last_tick:
-            print("\n=== new heat detected, resetting ===")
+            banner("NEW HEAT")
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
         ST.last_tick = tick
@@ -430,18 +438,23 @@ def main():
         fx_hedge(snap)
 
         if tick != last_print:
+            for what, (qty, edge) in ST.arb_acc.items():
+                event(last_print if last_print > 0 else tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
+            ST.arb_acc = {}
             last_print = tick
             p = snap["pos"]
             u = usage(p, snap["gross_limit"], snap["net_limit"])
             nlv = (get("/trader") or {}).get("nlv", float("nan"))
             log.writerow([tick, p.get("BULL"), p.get("BEAR"), p.get("RITC"), round(p.get("USD", 0)), round(u, 3), nlv])
             logf.flush()
-            print(f"t={tick:3d} BULL={p.get('BULL', 0):8,.0f} BEAR={p.get('BEAR', 0):8,.0f} "
-                  f"RITC={p.get('RITC', 0):8,.0f} USD={p.get('USD', 0):10,.0f} limits={u:4.0%} nlv={nlv:12,.2f}",
-                  end="\r")
+            if tick % STATUS_EVERY == 0:
+                r_ = p.get("RITC", 0)
+                hedged = abs(p.get("BULL", 0) + r_) < 200 and abs(p.get("BEAR", 0) + r_) < 200
+                event(tick, "status", f"RITC {r_:+7,.0f}  BULL {p.get('BULL', 0):+7,.0f}  BEAR {p.get('BEAR', 0):+7,.0f}  "
+                                      f"{'ok' if hedged else 'HEDGING'}  limits {u:3.0%}  P&L {nlv:+8,.0f}")
         time.sleep(LOOP_SLEEP)
     logf.close()
-    print("\nStopped.")
+    say("Stopped.")
 
 
 if __name__ == "__main__":

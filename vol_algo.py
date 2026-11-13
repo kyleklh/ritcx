@@ -30,6 +30,7 @@ from datetime import datetime
 import requests
 
 import bs
+from display import say, event, banner
 
 # =========================== SETTINGS (tune between heats) ===========================
 API = os.environ.get("RIT_API", "http://localhost:9999/v1")
@@ -58,6 +59,7 @@ OPTION_DELTA_REBAL = 35000    # if price moves push |option delta| past this, cu
                               # (the normal logic then re-adds risk in delta-reducing strikes)
 STOP_OPENING_TICKS_BEFORE_END = 25   # no new option risk this close to expiry
 CLOSE_TICKS_BEFORE_END = 15   # close all options in the last N ticks (gamma explodes near expiry)
+STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.2))             # seconds between loops
 LOG_FILE = f"vol_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
 # =====================================================================================
@@ -85,6 +87,8 @@ class State:
         self.week_len = 75
         self.tpy = 3600
         self.last_tick = -1
+        self.fill_acc = {}        # (side, ticker) -> contracts, printed once per tick
+        self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
 
 
 ST = State()
@@ -101,7 +105,7 @@ def api_get(path, **params):
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:
-            print(f"[warn] GET {path} failed: {e}")
+            say(f"[warn] GET {path} failed: {e}")
             time.sleep(0.2)
     return None
 
@@ -118,11 +122,11 @@ def place(ticker, action, qty):
                 time.sleep(float(r.json().get("wait", 0.1)))
                 continue
             if not r.ok:
-                print(f"[order rejected] {action} {qty} {ticker}: {r.text[:120]}")
+                say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120]}")
                 return 0
             return int(r.json().get("quantity_filled", qty))
         except requests.RequestException as e:
-            print(f"[warn] order failed: {e}")
+            say(f"[warn] order failed: {e}")
             time.sleep(0.2)
     return 0
 
@@ -153,13 +157,15 @@ def parse_news():
         if "next week" in low and m_range:
             lo, hi = float(m_range.group(1)), float(m_range.group(2))
             ST.vol_est[w + 1] = (lo + hi) / 200
-            print(f"\n[NEWS t={n.get('tick')}] next week (wk {w + 1}) range {lo}-{hi}% -> est {ST.vol_est[w + 1]:.3f}")
+            event(n.get("tick", 0), "NEWS", f"Week {w + 1} vol forecast {lo:g}-{hi:g}%  -> using {ST.vol_est[w + 1]:.1%}")
         elif m_point and "volatil" in low:
             target = w + 1 if "next week" in low else w
             ST.vol_known[target] = float(m_point.group(1)) / 100
-            print(f"\n[NEWS t={n.get('tick')}] week {target} vol = {ST.vol_known[target]:.3f}")
+            event(n.get("tick", 0), "NEWS", f"Week {target} vol is {ST.vol_known[target]:.1%}")
+        elif "volatil" in low and "%" in text:
+            event(n.get("tick", 0), "NEWS !!", f"NOT PARSED, type v/n yourself: {text[:110]}")
         else:
-            print(f"\n[NEWS t={n.get('tick')}] (not parsed) {text[:140]}")
+            event(n.get("tick", 0), "INFO", text[:110])
 
 
 def vol_for_week(w):
@@ -243,6 +249,7 @@ def quick_hedge(tick, d):
         if filled <= 0:
             break
         sg = 1 if side == "BUY" else -1
+        ST.hedge_acc += sg * filled
         ST.rtm_pos += sg * filled
         d += sg * filled
         need -= sg * filled
@@ -264,6 +271,7 @@ def trade_options(info, tick, gcap):
     cands.sort(reverse=True)
     traded = False
     n_orders = 0
+    fills = {}
     opt_delta = sum(o["pos"] * 100 * o["delta"] for o in info.values())
     book_g = sum(o["pos"] * 100 * o["gamma"] for o in info.values())
     for edge, tk, side in cands:
@@ -300,9 +308,13 @@ def trade_options(info, tick, gcap):
             ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
             if abs(ST.run_delta) > HEDGE_TRIGGER:
                 ST.run_delta = quick_hedge(tick, ST.run_delta)
-            print(f"  t={tick} {side} {filled} {tk} edge ${edge * 100:.0f}/contract  (net {net}, gross {gross})")
+            k = (side, tk)
+            fills[k] = (fills.get(k, (0, edge))[0] + filled, edge)
         if n_orders >= MAX_ORDERS_PER_LOOP:
             break
+    for k, (qty, edge) in fills.items():
+        prev = ST.fill_acc.get(k, (0, edge))[0]
+        ST.fill_acc[k] = (prev + qty, edge)
     return traded
 
 
@@ -333,7 +345,7 @@ def trim_gamma(info, tick, gcap):
         if abs(ST.run_delta) > HEDGE_TRIGGER:
             ST.run_delta = quick_hedge(tick, ST.run_delta)
         traded = True
-        print(f"  t={tick} TRIM GAMMA: {side} {filled} {tk} (book gamma {book_g:,.0f}, cap {gcap:,.0f})")
+        event(tick, "RISK", f"{side} {filled} {tk} to cut gamma (gamma {book_g:,.0f}, cap {gcap:,.0f})")
     return traded
 
 
@@ -358,7 +370,7 @@ def rebalance_option_delta(info, tick):
             ST.run_delta += (-filled if side == "SELL" else filled) * 100 * o["delta"]
             ST.run_delta = quick_hedge(tick, ST.run_delta)
             traded = True
-            print(f"  t={tick} REBALANCE option delta {opt_delta:,.0f}: {side} {filled} {tk}")
+            event(tick, "RISK", f"{side} {filled} {tk} to cut option delta ({opt_delta:,.0f})")
     return traded
 
 
@@ -382,7 +394,7 @@ def close_options(info, tick):
         if n >= MAX_ORDERS_PER_LOOP:
             break
     if traded:
-        print(f"  t={tick} CLOSING options before expiry")
+        event(tick, "CLOSE", "closing options before expiry")
     return traded
 
 
@@ -393,7 +405,7 @@ def hedge(sec, info, tick, force=False):
     need = int(round(HEDGE_TARGET - d))
     rtm = int(sec["RTM"]["position"])
     need = max(-RTM_LIMIT - rtm, min(RTM_LIMIT - rtm, need))
-    did = False
+    did = 0
     while abs(need) >= 1:
         q = min(RTM_MAX_ORDER, abs(need))
         side = "BUY" if need > 0 else "SELL"
@@ -402,12 +414,22 @@ def hedge(sec, info, tick, force=False):
             break
         need -= filled if side == "BUY" else -filled
         d += filled if side == "BUY" else -filled
-        did = True
+        did += filled if side == "BUY" else -filled
     if did:
-        print(f"  t={tick} HEDGE -> delta {d:,.0f}")
+        ST.hedge_acc += did
     elif abs(d) > 7000:
-        print(f"  t={tick} !! CANNOT HEDGE (RTM limit), delta {d:,.0f}")
+        event(tick, "!! RISK", f"CANNOT HEDGE (RTM limit), delta {d:+,.0f}")
     return d
+
+
+def flush_tick(tick):
+    """Print this tick's trades and hedges as one line each."""
+    for (side, tk), (qty, edge) in sorted(ST.fill_acc.items()):
+        event(tick, side, f"{qty:>4} x {tk:<7} edge ${edge * 100:,.0f}/contract")
+    if ST.hedge_acc:
+        event(tick, "HEDGE", f"{'bought' if ST.hedge_acc > 0 else 'sold'} {abs(ST.hedge_acc):,} RTM")
+    ST.fill_acc = {}
+    ST.hedge_acc = 0
 
 
 # ------------------------------- console commands -------------------------------
@@ -422,31 +444,31 @@ def console():
             w = week_of(max(1, tick))
             if c == "v" and len(parts) >= 2:
                 ST.vol_known[w] = float(parts[1]) / 100
-                print(f"[override] week {w} vol = {ST.vol_known[w]:.3f}")
+                say(f"[override] week {w} vol = {ST.vol_known[w]:.3f}")
             elif c == "n" and len(parts) >= 3:
                 ST.vol_est[w + 1] = (float(parts[1]) + float(parts[2])) / 200
-                print(f"[override] week {w + 1} est = {ST.vol_est[w + 1]:.3f}")
+                say(f"[override] week {w + 1} est = {ST.vol_est[w + 1]:.3f}")
             elif c == "p":
                 ST.paused = True
-                print("[paused] no new option trades; hedging continues")
+                say("[paused] no new option trades; hedging continues")
             elif c == "r":
                 ST.paused = False
-                print("[resumed]")
+                say("[resumed]")
             elif c == "h":
                 ST.force_hedge = True
             elif c == "s":
-                print(f"[status] known={ST.vol_known} est={ST.vol_est} paused={ST.paused}")
+                say(f"[status] known={ST.vol_known} est={ST.vol_est} paused={ST.paused}")
             elif c == "q":
                 ST.quit = True
                 return
         except Exception as e:
-            print(f"[console error] {e}")
+            say(f"[console error] {e}")
 
 
 # ------------------------------- main loop -------------------------------
 def main():
     threading.Thread(target=console, daemon=True).start()
-    print("Waiting for case to be ACTIVE...  (type v/n/p/r/h/s/q + Enter for commands)")
+    banner("VOL ALGO  |  waiting for the case to start\nCommands (type + Enter): v 25 | n 27 30 | p pause | r resume | h hedge | s status | q quit")
     logf = open(LOG_FILE, "w", newline="")
     log = csv.writer(logf)
     log.writerow(["tick", "S", "fair_vol", "atm_iv", "net_contracts", "delta", "nlv"])
@@ -458,8 +480,10 @@ def main():
             continue
         tick = case["tick"]
         if tick < ST.last_tick:                       # new heat started: reset memory
-            print("\n=== new heat detected, resetting state ===")
+            banner("NEW HEAT")
             ST.reset()
+        if ST.last_tick == -1 and tick > 5:
+            event(tick, "NOTE", f"joined mid-heat at tick {tick}; reading past news first")
         ST.last_tick = tick
         ST.ticks = case.get("ticks_per_period", 300)
         ST.week_len = ST.ticks // 4
@@ -496,6 +520,7 @@ def main():
         ST.force_hedge = False
 
         if tick != last_print:
+            flush_tick(last_print if last_print > 0 else tick)
             last_print = tick
             atm = min(STRIKES, key=lambda k: abs(k - S))
             atm_iv = info[CALLS[atm]]["iv"]
@@ -504,11 +529,13 @@ def main():
             nlv = trader.get("nlv", float("nan"))
             log.writerow([tick, round(S, 2), round(fv, 4), round(atm_iv or 0, 4), net, round(d), nlv])
             logf.flush()
-            print(f"t={tick:3d} S={S:6.2f} fair={fv:.3f} atmIV={(atm_iv or 0):.3f} "
-                  f"net={net:5d} delta={d:8,.0f} nlv={nlv:12,.2f}", end="\r")
+            if tick % STATUS_EVERY == 0:
+                mkt = f"{atm_iv:5.1%}" if atm_iv else "  -- "
+                event(tick, "status", f"RTM {S:6.2f}  vol {fv:5.1%} vs mkt {mkt}  net {net:+5d}  "
+                                      f"delta {d:+7,.0f}  P&L {nlv:+9,.0f}")
         time.sleep(LOOP_SLEEP)
     logf.close()
-    print("\nStopped.")
+    say("Stopped.")
 
 
 if __name__ == "__main__":
