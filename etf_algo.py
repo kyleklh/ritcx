@@ -88,6 +88,7 @@ s.headers.update({"X-API-Key": API_KEY})
 class State:
     paused = False
     quit = False
+    last_detail = ""
     seen_tenders = set()
     last_tick = -1
     last_prompt_tick = -100
@@ -265,6 +266,14 @@ def evaluate_tender(t, snap):
         edge = (px * usd if px else breakeven_usd * usd - TENDER_MIN_EDGE) - basket - extra
         bid = math.ceil(breakeven_usd * 100) / 100
     note = f"{n_conv} conversion{'s' if n_conv != 1 else ''}"
+    # breakdown for the log: where the edge goes (all CAD per share)
+    mid_basket = mids["BULL"] + mids["BEAR"]
+    leg = "bids" if act == "BUY" else "asks"
+    top = lambda t: (bk[t][leg][0][1] if bk[t][leg] else 0)
+    depth = lambda t: sum(sz for _, sz in bk[t][leg][:10])
+    ST.last_detail = (f"tender {px * usd if px else float('nan'):.3f} CAD vs basket mid {mid_basket:.3f} | "
+                      f"hedge cost {abs(mid_basket - basket):.3f} | converters+wait {extra:.3f} | "
+                      f"BULL top/10lvl {top('BULL'):,}/{depth('BULL'):,}  BEAR {top('BEAR'):,}/{depth('BEAR'):,}")
     if t.get("is_fixed_bid", True):
         if edge < TENDER_MIN_EDGE or edge * q < TENDER_MIN_PROFIT:
             return edge, None, f"edge too small, after {note}"
@@ -282,6 +291,8 @@ def handle_tenders(snap, tick):
         if ST.paused:
             event(tick, "TENDER", f"#{tid} ignored (paused)")
             continue
+        ST.last_detail = ""
+        say(f"[tender raw] {t}")
         edge, bid, why = evaluate_tender(t, snap)
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
@@ -301,6 +312,8 @@ def handle_tenders(snap, tick):
         else:
             _req("DELETE", f"/tenders/{tid}")
             event(tick, "TENDER", f"decline {desc}  edge {edge:+.3f}/sh  ({why})")
+        if ST.last_detail:
+            event(tick, "  why", ST.last_detail)
     return False
 
 
