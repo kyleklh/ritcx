@@ -64,6 +64,8 @@ ARB_OPEN_EDGE = 0.03          # CAD/share net of 3 fees, to OPEN / grow pairs
 ARB_CLOSE_EDGE = 0.00         # CAD/share net of fees, to CLOSE existing pairs (frees capacity)
 ARB_CLIP = 5000
 ARB_MAX_PAIRS = 20000         # max |RITC| the arb module builds on its own (keeps limit room for tenders)
+ROOM_TARGET = 20000           # after a tender, unwind pairs above this |RITC| to make room for the next one...
+ROOM_UNWIND_EDGE = -0.03      # ...even at a small loss: up to this CAD/share past fees (converting costs ~0.15)
 
 # FX
 FX_BAND = 20000               # re-hedge when |USD cash| > this
@@ -299,12 +301,17 @@ def evaluate_tender(t, snap):
     pos = snap["pos"]
     # limits: we must be able to hold the tender before any hedge trades
     u_now = usage(pos, gl, nl, d_ritc=side * q)
+    limit_block = None
     if u_now > LIMIT_TRANSIENT_MAX:
-        return 0.0, None, f"limits (usage would be {u_now:.0%} before hedging)"
+        limit_block = f"limits (usage would be {u_now:.0%} before hedging)"
+    else:
+        n_try = blocks_to_convert(pos, gl, nl, d_ritc=side * q)
+        if n_try * CONVERT_BLOCK > abs(pos.get("RITC", 0) + side * q):
+            limit_block = "limits (converters cannot make enough room)"
+    if limit_block:
+        pos = {}          # still value it, as if we were flat, so the log shows what the refusal cost
     n_conv = blocks_to_convert(pos, gl, nl, d_ritc=side * q)
     new_r = pos.get("RITC", 0) + side * q
-    if n_conv * CONVERT_BLOCK > abs(new_r):
-        return 0.0, None, "limits (converters cannot make enough room)"
     # shares of each leg we can hedge right away; the rest waits for converters
     g_now = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(new_r)
     hedge_now = max(0.0, min(q, (HEDGE_USAGE_MAX * gl - g_now) / 2))
@@ -329,6 +336,8 @@ def evaluate_tender(t, snap):
     ST.last_detail = (f"tender {px * usd if px else float('nan'):.3f} CAD vs basket mid {mid_basket:.3f} | "
                       f"hedge cost {abs(mid_basket - basket):.3f} | converters+wait {extra:.3f} | "
                       f"BULL top/10lvl {top('BULL'):,}/{depth('BULL'):,}  BEAR {top('BEAR'):,}/{depth('BEAR'):,}")
+    if limit_block:
+        return edge, None, f"{limit_block}; edge if we had been flat {edge:+.3f}/sh = ${edge * q:,.0f}"
     if t.get("is_fixed_bid", True):
         if edge < TENDER_MIN_EDGE or edge * q < TENDER_MIN_PROFIT:
             return edge, None, f"edge too small, after {note}"
@@ -456,6 +465,30 @@ def arb(snap, tick):
     size = min(ARB_CLIP, bk["RITC"]["bids"][0][1] if bk["RITC"]["bids"] else 0,
                bk["BULL"]["asks"][0][1] if bk["BULL"]["asks"] else 0,
                bk["BEAR"]["asks"][0][1] if bk["BEAR"]["asks"] else 0)
+    room_unwind = abs(r) > ROOM_TARGET   # holding big pairs from a tender: shrink them toward ROOM_TARGET
+    if r > 0 and room_unwind and ROOM_UNWIND_EDGE < sell_etf <= ARB_CLOSE_EDGE:
+        qty = min(size, r - ROOM_TARGET)
+        if qty >= 100:
+            f = market("RITC", "SELL", qty, r)
+            pos["RITC"] = r - f
+            if f:
+                a = ST.arb_acc.setdefault("UNWIND for room: sell RITC / buy basket", [0, 0])
+                a[0] += f
+                a[1] = sell_etf
+            return f > 0
+    if r < 0 and room_unwind and ROOM_UNWIND_EDGE < buy_etf <= ARB_CLOSE_EDGE:
+        size_b = min(ARB_CLIP, bk["RITC"]["asks"][0][1] if bk["RITC"]["asks"] else 0,
+                     bk["BULL"]["bids"][0][1] if bk["BULL"]["bids"] else 0,
+                     bk["BEAR"]["bids"][0][1] if bk["BEAR"]["bids"] else 0)
+        qty = min(size_b, -r - ROOM_TARGET)
+        if qty >= 100:
+            f = market("RITC", "BUY", qty, r)
+            pos["RITC"] = r + f
+            if f:
+                a = ST.arb_acc.setdefault("UNWIND for room: buy RITC / sell basket", [0, 0])
+                a[0] += f
+                a[1] = buy_etf
+            return f > 0
     if sell_etf > (ARB_CLOSE_EDGE if r > 0 else ARB_OPEN_EDGE):
         qty = min(size, r) if r > 0 else min(size, ARB_MAX_PAIRS + r)
         if qty >= 100 and usage(pos, gl, nl, d_ritc=-qty, d_bull=qty, d_bear=qty) <= LIMIT_USAGE_MAX:
