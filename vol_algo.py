@@ -47,7 +47,7 @@ MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
 MAX_GROSS_CONTRACTS = 2400    # case limit 2500 gross
 
 HEDGE_TRIGGER = 2000          # re-hedge when |delta| > this (case limit 7000)
-GAMMA_Z = 3.0                 # size the book so a GAMMA_Z-sigma one-tick move can't push delta past the limit.
+GAMMA_Z = float(os.environ.get("GAMMA_Z", 2.0))                # size the book so a GAMMA_Z-sigma one-tick move can't push delta past the limit.
                               # Higher = safer/smaller. Gamma grows near expiry, so this shrinks size automatically.
 HEDGE_TARGET = 0
 RTM_MAX_ORDER = 10000
@@ -58,7 +58,12 @@ OPTION_DELTA_CAP = 25000      # max |delta| of the OPTIONS book alone. RTM limit
 OPTION_DELTA_REBAL = 35000    # if price moves push |option delta| past this, cut the positions driving it
                               # (the normal logic then re-adds risk in delta-reducing strikes)
 STOP_OPENING_TICKS_BEFORE_END = 25   # no new option risk this close to expiry
-CLOSE_TICKS_BEFORE_END = 15   # close all options in the last N ticks (gamma explodes near expiry)
+CLOSE_TICKS_BEFORE_END = 15   # in the last N ticks, close options near the money (gamma explodes there)
+CLOSE_NEAR = 1.5              # ...only strikes within $1.50 of RTM. Far ITM/OTM ones are held to expiry
+                              # (cash-settled for free; their delta is stable, so they are easy to hedge)
+GAMMA_TRIM_ABOVE = 1.25       # cut gamma only when the book is 25% over the cap...
+GAMMA_ADD_UP_TO = 0.90        # ...and add new risk only up to 90% of it (the gap stops buy/sell ping-pong)
+MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.2))             # seconds between loops
 LOG_FILE = f"vol_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
@@ -234,9 +239,10 @@ def portfolio_delta(sec, info):
     return d
 
 
-def gamma_cap(S, fv):
-    """Max |book gamma| (shares per $1) so a GAMMA_Z-sigma tick move stays inside the delta limit."""
-    move = GAMMA_Z * fv / math.sqrt(ST.tpy) * S
+def gamma_cap(S, vol_now):
+    """Max |book gamma| (shares per $1) so a GAMMA_Z-sigma tick move stays inside the delta limit.
+    Uses THIS week's vol: the next tick's move depends on current vol, not the average over the month."""
+    move = GAMMA_Z * vol_now / math.sqrt(ST.tpy) * S
     return (7000 - HEDGE_TRIGGER) / move
 
 
@@ -279,6 +285,7 @@ def trade_options(info, tick, gcap):
     fills = {}
     opt_delta = sum(o["pos"] * 100 * o["delta"] for o in info.values())
     book_g = sum(o["pos"] * 100 * o["gamma"] for o in info.values())
+    gcap = gcap * GAMMA_ADD_UP_TO
     for edge, tk, side in cands:
         while n_orders < MAX_ORDERS_PER_LOOP:
             pos = info[tk]["pos"]
@@ -296,7 +303,10 @@ def trade_options(info, tick, gcap):
             g_per = (1 if side == "BUY" else -1) * 100 * info[tk]["gamma"]
             if g_per and abs(book_g + g_per * q) > gcap and abs(book_g + g_per * q) > abs(book_g):
                 q = min(q, int(max(0, (gcap - abs(book_g)) / abs(g_per))))
-            if q <= 0:
+            closing = (side == "BUY" and pos < 0) or (side == "SELL" and pos > 0)
+            if closing:
+                q = min(q, abs(pos)) if q > 0 else 0
+            if q <= 0 or (q < MIN_OPEN_QTY and not closing):
                 break
             filled = place(tk, side, q)
             n_orders += 1
@@ -326,7 +336,7 @@ def trade_options(info, tick, gcap):
 def trim_gamma(info, tick, gcap):
     """As expiry nears, gamma per contract rises. Cut the highest-gamma legs when the book exceeds the cap."""
     book_g = sum(o["pos"] * 100 * o["gamma"] for o in info.values())
-    if abs(book_g) <= gcap * 1.1:
+    if abs(book_g) <= gcap * GAMMA_TRIM_ABOVE:
         return False
     sg = 1 if book_g > 0 else -1
     traded = False
@@ -379,11 +389,14 @@ def rebalance_option_delta(info, tick):
     return traded
 
 
-def close_options(info, tick):
-    """Unwind options before expiry, a few orders per loop. Returns True if anything traded."""
+def close_options(info, tick, S):
+    """Before expiry, unwind options NEAR THE MONEY (their delta can flip 0 <-> 1 in a tick).
+    Far ITM/OTM options are held: they settle for free and their delta is stable."""
     traded = False
     n = 0
     for tk, o in sorted(info.items(), key=lambda kv: -abs(kv[1]["pos"])):
+        if abs(o["K"] - S) > CLOSE_NEAR:
+            continue
         while o["pos"] != 0 and n < MAX_ORDERS_PER_LOOP:
             q = min(CLIP, abs(o["pos"]))
             side = "SELL" if o["pos"] > 0 else "BUY"
@@ -399,7 +412,7 @@ def close_options(info, tick):
         if n >= MAX_ORDERS_PER_LOOP:
             break
     if traded:
-        event(tick, "CLOSE", "closing options before expiry")
+        event(tick, "CLOSE", f"closing options within ${CLOSE_NEAR} of RTM before expiry")
     return traded
 
 
@@ -516,9 +529,9 @@ def main():
         ST.rtm_pos = int(sec["RTM"]["position"])
         ST.run_delta = portfolio_delta(sec, info)
         if tick >= ST.ticks - CLOSE_TICKS_BEFORE_END:
-            traded = close_options(info, tick)
+            traded = close_options(info, tick, S)
         else:
-            gcap = gamma_cap(S, fv)
+            gcap = gamma_cap(S, vol_for_week(week_of(tick)) or fv)
             traded = trim_gamma(info, tick, gcap)
             traded = rebalance_option_delta(info, tick) or traded
             traded = trade_options(info, tick, gcap) or traded
