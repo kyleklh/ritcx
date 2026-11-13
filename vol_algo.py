@@ -41,6 +41,10 @@ RISK_FREE = 0.0
 
 OPT_FEE_PER_SHARE = 0.02      # $2 per contract / 100 shares
 MIN_EDGE = 0.02               # extra $/share of mispricing required beyond fees (safety margin)
+REVERSE_EDGE = 0.10           # edge needed to flip the book's direction (long<->short): a flip pays the
+                              # ~$3/contract round trip twice, so small vol wobbles shouldn't trigger it.
+                              # The "direction" is remembered until the book has been flat for a while, so
+                              # closing shorts and then opening longs at a small edge still counts as a flip.
 CLIP = 100                    # contracts per order (max 100)
 MAX_ORDERS_PER_LOOP = 4       # how many option orders to fire per loop (fast entry after news)
 MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
@@ -95,6 +99,7 @@ class State:
         self.last_slow_warn = -100
         self.flush_tick = 0
         self.fill_acc = {}        # (side, ticker) -> contracts, printed once per tick
+        self.book_dir = 0         # +1 long / -1 short: the direction the book last had, kept while flat
         self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
 
 
@@ -264,6 +269,11 @@ def quick_hedge(tick, d):
     return d
 
 
+def side_opens_against_book(side):
+    """True when opening on this side goes against the book's remembered direction (a reversal)."""
+    return (side == "BUY" and ST.book_dir < 0) or (side == "SELL" and ST.book_dir > 0)
+
+
 def trade_options(info, tick, gcap):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
@@ -273,10 +283,19 @@ def trade_options(info, tick, gcap):
     # Rank by edge, but trades that CLOSE an existing position go first: when the view flips,
     # buying back old shorts beats opening offsetting longs at a nearby strike (saves fees + limit room).
     cands = []
+    net_now = sum(o["pos"] for o in info.values())
+    if net_now > 50:
+        ST.book_dir = 1
+    elif net_now < -50:
+        ST.book_dir = -1
+    # (when flat, book_dir keeps its last value so a close-then-reopen the other way still counts as a flip)
     for tk, o in info.items():
-        if o["buy_edge"] > MIN_EDGE:
+        # opening against the book's remembered direction is a reversal: ask for more edge
+        buy_need = REVERSE_EDGE if (ST.book_dir < 0 and o["pos"] >= 0) else MIN_EDGE
+        sell_need = REVERSE_EDGE if (ST.book_dir > 0 and o["pos"] <= 0) else MIN_EDGE
+        if o["buy_edge"] > buy_need:
             cands.append((o["pos"] < 0, o["buy_edge"], tk, "BUY"))
-        if o["sell_edge"] > MIN_EDGE:
+        if o["sell_edge"] > sell_need:
             cands.append((o["pos"] > 0, o["sell_edge"], tk, "SELL"))
     cands.sort(reverse=True)
     cands = [(edge, tk, side) for _, edge, tk, side in cands]
@@ -306,6 +325,8 @@ def trade_options(info, tick, gcap):
             closing = (side == "BUY" and pos < 0) or (side == "SELL" and pos > 0)
             if closing:
                 q = min(q, abs(pos)) if q > 0 else 0
+            elif pos == 0 and side_opens_against_book(side):
+                break   # this strike is now flat; reopening the other way is a reversal, re-judged next pass
             if q <= 0 or (q < MIN_OPEN_QTY and not closing):
                 break
             filled = place(tk, side, q)
@@ -391,11 +412,24 @@ def rebalance_option_delta(info, tick):
 
 def close_options(info, tick, S):
     """Before expiry, unwind options NEAR THE MONEY (their delta can flip 0 <-> 1 in a tick).
-    Far ITM/OTM options are held: they settle for free and their delta is stable."""
+    Far ITM/OTM options are held: they settle for free and their delta is stable.
+    But the far ones must still be hedgeable: if their combined delta exceeds what RTM can absorb
+    (RTM_LIMIT minus a buffer), close the biggest-delta legs too until it fits."""
     traded = False
     n = 0
-    for tk, o in sorted(info.items(), key=lambda kv: -abs(kv[1]["pos"])):
-        if abs(o["K"] - S) > CLOSE_NEAR:
+    far = [(tk, o) for tk, o in info.items() if abs(o["K"] - S) > CLOSE_NEAR and o["pos"]]
+    far_delta = sum(o["pos"] * 100 * o["delta"] for _, o in far)
+    must_close = {tk for tk, o in info.items() if abs(o["K"] - S) <= CLOSE_NEAR}
+    if abs(far_delta) > RTM_LIMIT - 5000:
+        # close far legs in order of how much delta they carry, until the remainder is hedgeable
+        for tk, o in sorted(far, key=lambda kv: -abs(kv[1]["pos"] * kv[1]["delta"])):
+            if abs(far_delta) <= RTM_LIMIT - 5000:
+                break
+            must_close.add(tk)
+            far_delta -= o["pos"] * 100 * o["delta"]
+    order = sorted(info.items(), key=lambda kv: -abs(kv[1]["pos"] * kv[1]["delta"]))   # most delta first
+    for tk, o in order:
+        if tk not in must_close:
             continue
         while o["pos"] != 0 and n < MAX_ORDERS_PER_LOOP:
             q = min(CLIP, abs(o["pos"]))

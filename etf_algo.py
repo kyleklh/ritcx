@@ -47,6 +47,8 @@ LIMIT_TRANSIENT_MAX = 0.99    # max usage in the moment after accepting, before 
 
 # Hedging: passive first (limit orders earn the rebate), market orders only for risk above URGENT_GAP
 URGENT_GAP = 10000            # max unhedged shares per leg we tolerate; anything beyond is hedged at market
+THIN_BOOK = 2500              # if fewer shares than this sit at the best price, the book is "thin":
+THIN_GAP_MULT = 2.0           # ...tolerate URGENT_GAP x this before hitting it with market orders
 HEDGE_SLIP = 0.03             # market hedges only take liquidity within this distance of the best price
 HEDGE_MIN = 100               # ignore smaller imbalances
 REBATE = 0.01
@@ -276,8 +278,11 @@ def hedge(snap, tick, orders=None):
     for leg in ("BULL", "BEAR"):
         gap = int(round(target - pos.get(leg, 0)))
         side = "BUY" if gap > 0 else "SELL"
-        # 1) urgent part at market
-        urgent = abs(gap) - URGENT_GAP
+        # 1) urgent part at market (a thin book gets more patience: market orders there cost a lot)
+        top = (bk[leg]["asks"] if gap > 0 else bk[leg]["bids"])
+        top_size = top[0][1] if top else 0
+        tolerance = URGENT_GAP * (THIN_GAP_MULT if top_size < THIN_BOOK else 1.0)
+        urgent = abs(gap) - tolerance
         if urgent >= HEDGE_MIN:
             levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
             avail = max(levels[0][1] if levels else 0, depth_within(levels, HEDGE_SLIP))
