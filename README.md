@@ -117,6 +117,10 @@ Batch test, 6 heats at 5x speed:
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
+6. **Late fills**: the real server can show a fill in `/securities` a moment after the order returns. After a
+   market order the algo does not trade that ticker again until the fill shows (or `INFLIGHT_TIMEOUT` passes),
+   and it resizes resting orders and the FX hedge once per tick. Without this, a slow server makes the hedges
+   re-send and flip-flop (2.5M USD orders back and forth). Test it with `MOCK_ARGS="--pos-lag 0.15" ./test_etf_batch.sh`.
 5. **Converters (human only)**: the case rules say the algo may NOT use the converters, so it never calls
    them. While the fully hedged book would not fit under `CONVERT_TARGET` usage, it prints
    `>>> CONVERTER: REDEEM 1 x 10,000 NOW` (long RITC) or `CREATE` (short RITC), and you click that converter

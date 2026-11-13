@@ -79,9 +79,9 @@ CONVERT_STOP_BEFORE_END = 5       # no new conversions in the last N ticks
 AUTO_CONVERT_MOCK = os.environ.get("AUTO_CONVERT_MOCK") == "1" and "localhost" in API
 REPROMPT_TICKS = 4                # repeat the prompt if nothing happened after this many ticks
 
-# The server can show a fill in /securities a moment AFTER the order returns. Until it does, the algo uses
-# its own record of the fill, so it never sends the same hedge twice (that loop caused huge USD flip-flops).
-INFLIGHT_TIMEOUT = 3.0        # seconds; after this, trust the server's position again
+# The server can show a fill in /securities a moment AFTER the order returns. Until it does, the algo
+# does not trade that ticker again (re-sending on a stale position caused huge USD flip-flops).
+INFLIGHT_TIMEOUT = 1.5        # seconds; after this, trade the ticker again even if the fill never showed
 DEFAULT_GROSS, DEFAULT_NET = 300_000, 200_000   # used if /limits is unavailable
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.15))
@@ -146,16 +146,17 @@ def note_fill(ticker, cur, signed_qty):
         ST.inflight[ticker] = {"base": cur, "total": signed_qty, "t": time.time()}
 
 
-def apply_inflight(pos):
-    """Replace stale server positions with base + our fills until the server catches up (or times out)."""
+def check_inflight(pos):
+    """Clear a ticker once /securities shows our fill (or after the timeout). Never edits positions."""
     now = time.time()
     for tk, f in list(ST.inflight.items()):
-        unseen = f["total"] - (pos.get(tk, 0) - f["base"])
-        tol = 1000 if tk == "USD" else max(100, 0.05 * abs(f["total"]))
-        if abs(unseen) <= tol or now - f["t"] > INFLIGHT_TIMEOUT:
+        moved = (pos.get(tk, 0) - f["base"]) * (1 if f["total"] > 0 else -1)
+        if moved >= 0.9 * abs(f["total"]) or now - f["t"] > INFLIGHT_TIMEOUT:
             del ST.inflight[tk]
-        else:
-            pos[tk] = f["base"] + f["total"]
+
+
+def busy(*tickers):
+    return any(t in ST.inflight for t in tickers)
 
 
 def market(ticker, action, qty, cur):
@@ -179,7 +180,7 @@ def snapshot():
     if not secs:
         return None
     pos = {x["ticker"]: float(x.get("position", 0)) for x in secs}
-    apply_inflight(pos)
+    check_inflight(pos)
     quotes = {x["ticker"]: (float(x.get("bid", 0) or 0), float(x.get("ask", 0) or 0)) for x in secs}
     books = {}
     for t in ("BULL", "BEAR", "RITC"):
@@ -370,6 +371,8 @@ def hedge(snap, tick, orders=None, passive=True):
     gross = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(pos.get("RITC", 0))
     leg_room = max(0.0, (HEDGE_USAGE_MAX * snap["gross_limit"] - gross) / 2)   # gross we may add, per leg
     for leg in ("BULL", "BEAR"):
+        if busy(leg, "RITC"):
+            continue              # last fill not visible yet: wait rather than act on a stale position
         gap = int(round(target - pos.get(leg, 0)))
         p0 = pos.get(leg, 0)
         # only the part of the gap that moves this leg AWAY from zero adds gross: cap that part by the room
@@ -418,7 +421,7 @@ def hedge(snap, tick, orders=None, passive=True):
 
 # ------------------------------- 3. arbitrage -------------------------------
 def arb(snap, tick):
-    if ST.paused or snap["tick"] < ST.conv_busy_until:
+    if ST.paused or snap["tick"] < ST.conv_busy_until or busy("RITC", "BULL", "BEAR"):
         return False
     q, pos, bk = snap["q"], effective_pos(snap), snap["books"]
     if max(abs(pos.get(l, 0) + pos.get("RITC", 0)) for l in ("BULL", "BEAR")) > URGENT_GAP:
@@ -462,7 +465,7 @@ def arb(snap, tick):
 
 # ------------------------------- 4. FX -------------------------------
 def fx_hedge(snap):
-    if "USD" in ST.inflight or "RITC" in ST.inflight:
+    if busy("USD", "RITC"):
         return            # the USD cash from those trades may not show yet: wait instead of guessing
     usd = snap["pos"].get("USD", 0)
     if abs(usd) <= FX_BAND:
