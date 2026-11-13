@@ -72,7 +72,7 @@ class Sim:
         self.penalty = 0.0
         self.news = []
         self.orders = []
-        self._add_news("Welcome", "Volatility Trading Case (mock). RTM and options on RTM.")
+        # (the real server's t=1 message is added in step(); nothing is published at tick 0)
 
     # ---------- pricing ----------
     def T(self):
@@ -105,9 +105,9 @@ class Sim:
         return v - self.penalty
 
     # ---------- simulation ----------
-    def _add_news(self, headline, body):
+    def _add_news(self, headline, body, ticker=""):
         self.news.append({"news_id": len(self.news) + 1, "period": 1, "tick": self.tick,
-                          "ticker": "", "headline": headline, "body": body})
+                          "ticker": ticker, "headline": headline, "body": body})
 
     def week(self):
         return min(4, max(0, self.tick - 1) // self.week_len + 1)
@@ -125,18 +125,32 @@ class Sim:
             k = 1 - 0.5 ** (1 / self.half_life)
             self.mm_vol += (sigma - self.mm_vol) * k
             # news
+            # News wording and timing copied from the real RITCx practice server (Nov 2026):
+            #   t=1   ticker "Week 1", headline "Risk free rate and current annualized volatility of RTM"
+            #   t=36  "News 1": a 5-point range for next week
+            #   t=74  ticker "Week 2", "Announcement 1": the vol for the week now starting
+            #   t=111 "News 2", t=149 "Week 3"/"Announcement 2", t=186 "News 3", ...
             start = (w - 1) * self.week_len + 1
-            if self.tick == start:
-                self._add_news(f"Week {w} volatility",
-                               f"The realized volatility of RTM for this week will be {round(sigma * 100)}%")
-            if self.tick == start + self.week_len // 2 and w < 4:
+            if self.tick == 1:
+                self._add_news("Risk free rate and current annualized volatility of RTM",
+                               f"The current risk free rate is 0%. RTM is an ETF that mimics one of the major indices "
+                               f"in the simulated world and its current annualized realized volatility is "
+                               f"{round(sigma * 100)}%. This simulation consists of 20 trading days that are each "
+                               f"15 ticks in length.", ticker="Week 1")
+            elif w < 4 and self.tick == w * self.week_len - 1:
+                # one tick before week w+1 starts: announce week w+1's vol (real server: tick 74 -> "Week 2")
+                nxt = self.true_vols[w]
+                self._add_news(f"Announcement {w}",
+                               f"The realized volatility of RTM for this week will be {round(nxt * 100)}%",
+                               ticker=f"Week {w + 1}")
+            if self.tick == start + self.week_len // 2 - 2 and w < 4:
                 nv = self.true_vols[w] * 100
-                lo = round(nv - self.rng.uniform(0, 3))
+                lo = round(nv - self.rng.uniform(0, 5))
                 if self.alt.random() < self.range_miss:      # forecast range that MISSES the true vol
                     miss = self.alt.uniform(1, 3)          # true vol lies 1-3 points outside the range
-                    lo = round(nv + miss) if self.alt.random() < 0.5 else round(nv - 3 - miss)
-                self._add_news(f"Week {w + 1} volatility forecast",
-                               f"The realized volatility of RTM for next week will be between {lo}% and {lo + 3}%")
+                    lo = round(nv + miss) if self.alt.random() < 0.5 else round(nv - 5 - miss)
+                self._add_news(f"News {w}",
+                               f"The realized volatility of RTM for next week will be between {lo}% and {lo + 5}%")
             # CRO delta penalty
             d = abs(self.portfolio_delta())
             if d > DELTA_LIMIT:

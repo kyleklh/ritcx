@@ -146,7 +146,10 @@ def place(ticker, action, qty):
 # ------------------------------- news & vol -------------------------------
 NUM = r"(\d+(?:\.\d+)?)"
 RE_RANGE = re.compile(NUM + r"\s*%?\s*(?:-|–|~|to|and)\s*" + NUM + r"\s*%", re.I)
-RE_POINT = re.compile(r"will be\s*" + NUM + r"\s*%", re.I)
+RE_POINT = re.compile(r"(?:will be|is|of|at)\s*" + NUM + r"\s*%", re.I)
+RE_WEEK = re.compile(r"week\s*(\d)", re.I)
+RE_VOL_POINT = re.compile(r"volatil\w*(?:[^%\d]{0,60}?)(?:will be|is|of|at)\s*" + NUM + r"\s*%", re.I)
+NEWS_RAW_FILE = f"news_raw_{datetime.now():%Y%m%d_%H%M%S}.txt"   # every news item verbatim, for checking the parser
 
 
 def week_of(tick):
@@ -161,19 +164,38 @@ def parse_news():
         if n["news_id"] <= ST.last_news_id:
             continue
         ST.last_news_id = n["news_id"]
+        tick = n.get("tick", 0)
+        ticker = str(n.get("ticker", "") or "")
         text = f"{n.get('headline', '')} {n.get('body', '')}"
-        w = week_of(max(1, n.get("tick", 1)))
+        try:
+            with open(NEWS_RAW_FILE, "a") as f:
+                f.write(f"tick={tick} ticker={ticker!r} headline={n.get('headline', '')!r} body={n.get('body', '')!r}\n")
+        except OSError:
+            pass
+        # Which week does this item describe? The RIT 'ticker' field says "Week N" on announcements.
+        # Otherwise fall back to the tick. (On the real server the week-N vol is announced at the START
+        # of week N, e.g. "Week 2" at tick 74, so the ticker is the reliable source.)
+        m_week = RE_WEEK.search(ticker) or RE_WEEK.search(n.get("headline", "") or "")
+        w_tick = week_of(max(1, tick))
+        w = int(m_week.group(1)) if m_week else w_tick
         low = text.lower()
         m_range = RE_RANGE.search(text)
-        m_point = RE_POINT.search(text)
-        if "next week" in low and m_range:
+        # single number: the % that follows the word "volatil" within a few words, so "risk free rate is 0%"
+        # (which sits between a headline "volatility" and the body's "volatility is 39%") is skipped
+        m_point = None
+        for cand in RE_VOL_POINT.finditer(text):   # keep the LAST one: the announced vol ends these messages
+            m_point = cand
+        m_point = m_point or RE_POINT.search(text)
+        if m_range and ("next week" in low or "forecast" in low or not m_week):
+            # a range: a forecast for the week AFTER the current one
             lo, hi = float(m_range.group(1)), float(m_range.group(2))
-            ST.vol_est[w + 1] = (lo + hi) / 200
-            event(n.get("tick", 0), "NEWS", f"Week {w + 1} vol forecast {lo:g}-{hi:g}%  -> using {ST.vol_est[w + 1]:.1%}")
+            target = w_tick + 1
+            ST.vol_est[target] = (lo + hi) / 200
+            event(tick, "NEWS", f"Week {target} vol forecast {lo:g}-{hi:g}%  -> using {ST.vol_est[target]:.1%}")
         elif m_point and "volatil" in low:
             target = w + 1 if "next week" in low else w
             ST.vol_known[target] = float(m_point.group(1)) / 100
-            event(n.get("tick", 0), "NEWS", f"Week {target} vol is {ST.vol_known[target]:.1%}")
+            event(tick, "NEWS", f"Week {target} vol is {ST.vol_known[target]:.1%}")
         elif "volatil" in low and "%" in text:
             event(n.get("tick", 0), "NEWS !!", f"NOT PARSED, type v/n yourself: {text[:110]}")
         else:
