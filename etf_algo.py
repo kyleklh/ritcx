@@ -44,6 +44,7 @@ MAX_FX_ORDER = 2_500_000
 TENDER_MIN_EDGE = 0.04        # CAD/share profit required after hedge cost + fees
 TENDER_MIN_PROFIT = 500       # CAD total; skip tiny wins
 UNHEDGED_PENALTY = 0.03       # CAD/share charged on the part we cannot hedge right away (waits for converters)
+REFILL_PENALTY = 0.02         # CAD/share for hedge shares that must wait for the book to refill
 EVAL_SLICE = 20000            # walk the book for this many shares; assume patience for the rest
 EXTRA_SLIP_BEYOND_SLICE = 0.01  # extra CAD/share assumed on shares beyond the slice
 LIMIT_USAGE_MAX = 0.90        # arb keeps usage below this
@@ -247,12 +248,30 @@ def usage(pos, gl, nl, d_ritc=0, d_bull=0, d_bear=0):
 # ------------------------------- 1. tenders -------------------------------
 def leg_value(levels, mid, q, sgn):
     """Expected CAD/share (incl. fees) to trade q shares of one leg the way hedge() does:
-    the part beyond URGENT_GAP at market (walking the book), the rest passively near mid."""
+    - up to URGENT_GAP passively near mid (earning the rebate),
+    - the rest with market orders that only take liquidity within HEDGE_SLIP of the best price. What is there
+      now is priced from the book; the rest waits for the book to refill at about the same prices, plus
+      REFILL_PENALTY per share for the price risk while waiting."""
     qm = max(0, q - URGENT_GAP)
     qp = q - qm
     total = qp * (mid + sgn * REBATE * -1)          # passive: ~mid, plus rebate
     if qm:
-        total += qm * ((walk(levels, qm, sgn) or mid) + sgn * FEE)
+        if not levels:
+            return mid + sgn * (FEE + 0.10)         # empty book: assume it's expensive
+        best = levels[0][0]
+        near = [(px, sz) for px, sz in levels if abs(px - best) <= HEDGE_SLIP + 1e-9]
+        avail = sum(sz for _, sz in near)
+        take = min(qm, avail)
+        got, cost = 0, 0.0
+        for px, sz in near:
+            k = min(sz, take - got)
+            if k <= 0:
+                break
+            cost += k * px
+            got += k
+        vwap = cost / got if got else best
+        later = qm - take                            # waits for the book to refill
+        total += qm * (vwap + sgn * FEE) + later * sgn * REFILL_PENALTY
     return total / q
 
 
