@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run the ETF algo against N mock heats in parallel at 5x speed. Usage: ./test_etf_batch.sh [N] [first_seed]
-# Set AUTO_CONVERT_MOCK=1 to let the algo click the converters itself (mock only).
+# The algo converts through the mock's lease API. Set AUTO_CONVERT=0 to test the manual-prompt mode.
 N=${1:-6}; FIRST=${2:-1}
 cd "$(dirname "$0")"; mkdir -p test
 for i in $(seq 0 $((N-1))); do

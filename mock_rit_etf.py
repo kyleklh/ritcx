@@ -9,10 +9,13 @@ Approximates the case so you can develop without practice-server access:
   - Market fee $0.02/share. Max order 10,000 (equities). RITC counts 2x for limits.
   - Private tender offers (fixed price, and some competitive auctions) for RITC
   - Close-out at end at the CORRECT price (RITC valued at (BULL+BEAR)/USD)
-  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000) via a MOCK-ONLY endpoint,
-    standing in for the manual click in the RIT Client: python convert.py redeem
+  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000), two ways:
+      * the RIT lease API: POST /leases?ticker=ETF-Redemption, then POST /leases/{id}?from1=RITC&quantity1=10000&...
+        (each use takes 2 ticks; inputs leave at the start, outputs arrive at the end)
+      * a MOCK-ONLY instant endpoint standing in for the manual click: python convert.py redeem
+  - Limits and tender sizes match the practice-server reports: gross 300k, net 200k, tenders 70k-100k
 
-All numbers (depth, spreads, tender sizes, limits) are guesses. Tune them to match the practice server.
+Depth, spreads, tender discounts and shocks are still guesses.
 
 Usage:
     python mock_rit_etf.py                 # real speed (1 tick per second)
@@ -36,8 +39,9 @@ CONVERT_COST_USD = 1500.0
 
 
 class Sim:
-    def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=100_000,
-                 depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0):
+    def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=200_000,
+                 depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0,
+                 tender_min=70_000, tender_max=100_000):
         self.rng = random.Random(seed)
         r = self.rng
         self.ticks = ticks
@@ -68,6 +72,12 @@ class Sim:
         self.next_tender_tick = r.randint(5, 15)
         self.tender_id = 0
         self.tender_log = []
+        self.tender_min, self.tender_max = tender_min, tender_max
+        # converters (RIT "refinery" assets): lease once, then each use takes CONVERT_TICKS.
+        # Inputs leave at the start of a use, outputs arrive when it completes (one use at a time).
+        self.leases = {}          # ticker -> {"id", "ticker", "busy_until", "outputs"}
+        self.lease_seq = 0
+        self.conversions = 0
         self.last = {t: self.mid(t) for t in ["BULL", "BEAR", "RITC", "USD"]}
 
     # ---------- prices ----------
@@ -157,6 +167,7 @@ class Sim:
             if r.random() < 0.04:
                 self.shock += r.choice([-1, 1]) * r.uniform(0.08, 0.30) * self.shock_mult
             self._fill_limit_orders()
+            self._finish_conversions()
             self._tenders()
             if self.tick >= self.ticks:
                 self._close_out()
@@ -194,7 +205,7 @@ class Sim:
             self.next_tender_tick = self.tick + r.randint(15, 30)
             self.tender_id += 1
             action = r.choice(["BUY", "SELL"])
-            qty = r.choice([10000, 20000, 25000, 30000, 40000, 50000])
+            qty = r.randrange(self.tender_min, self.tender_max + 1, 1000)   # real server: 72k-98k
             fair = self.ritc_fair()
             # positive = good for us; sometimes a trap
             gift = r.gauss(self.gift_mean, 0.10)
@@ -259,6 +270,55 @@ class Sim:
             self.fees += CONVERT_COST_USD * n * self.F["USD"]
             return 200, {"success": True, "kind": kind, "quantity": qty}
 
+    # ---------- leases (converters via the API) ----------
+    LEASE_RECIPES = {
+        "ETF-Redemption": ({"RITC": 10000, "USD": 1500}, {"BULL": 10000, "BEAR": 10000}),
+        "ETF-Creation": ({"BULL": 10000, "BEAR": 10000, "USD": 1500}, {"RITC": 10000}),
+    }
+    CONVERT_TICKS = 2
+
+    def _lease_view(self, L):
+        return {"id": L["id"], "ticker": L["ticker"], "type": "REFINERY",
+                "convert_finish_tick": L["busy_until"] if L["busy_until"] > self.tick else None}
+
+    def lease(self, ticker):
+        with self.lock:
+            if ticker not in self.LEASE_RECIPES:
+                return 400, {"code": "INVALID", "message": f"Unknown asset {ticker}"}
+            if ticker not in self.leases:
+                self.lease_seq += 1
+                self.leases[ticker] = {"id": self.lease_seq, "ticker": ticker, "busy_until": 0, "outputs": None}
+            return 200, self._lease_view(self.leases[ticker])
+
+    def use_lease(self, lid, params):
+        with self.lock:
+            L = next((x for x in self.leases.values() if x["id"] == lid), None)
+            if not L:
+                return 404, {"code": "NOT_FOUND", "message": "No such lease"}
+            if L["busy_until"] > self.tick:
+                return 400, {"code": "INVALID", "message": "Asset is busy"}
+            ins, outs = self.LEASE_RECIPES[L["ticker"]]
+            given = {}
+            for i in (1, 2, 3):
+                if f"from{i}" in params:
+                    given[params[f"from{i}"]] = float(params.get(f"quantity{i}", 0))
+            if given != {k: float(v) for k, v in ins.items()}:
+                return 400, {"code": "INVALID", "message": f"Inputs must be {ins}"}
+            for k, v in ins.items():
+                self.pos[k] -= v
+            self.fees += ins["USD"] * self.F["USD"]
+            L["busy_until"] = self.tick + self.CONVERT_TICKS
+            L["outputs"] = dict(outs)
+            self.conversions += 1
+            return 200, self._lease_view(L)
+
+    def _finish_conversions(self):
+        for L in self.leases.values():
+            if L["outputs"] and self.tick >= L["busy_until"]:
+                for k, v in L["outputs"].items():
+                    self.pos[k] += v
+                L["outputs"] = None
+
     def _close_out(self):
         self.open_orders.clear()
         u = self.F["USD"]
@@ -267,7 +327,7 @@ class Sim:
         self.final_nlv = cad + usd * u
         self.status = "STOPPED"
         print(f"[mock] heat over. P&L={self.final_nlv:,.2f} CAD  (fees+converters {self.fees:,.2f}, "
-              f"depth {self.depth}, tenders accepted {len(self.tender_log)})", flush=True)
+              f"depth {self.depth}, tenders accepted {len(self.tender_log)}, conversions {self.conversions})", flush=True)
 
     def nlv(self):
         if self.status == "STOPPED":
@@ -390,6 +450,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, [o for o in s.orders if o["status"] == st])
             if path == "/v1/news":
                 return self._send(200, [])
+            if path == "/v1/leases":
+                return self._send(200, [s._lease_view(L) for L in s.leases.values()])
         self._send(404, {"code": "NOT_FOUND", "message": path})
 
     def do_POST(self):
@@ -407,6 +469,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(*SIM.accept_tender(int(path.rsplit("/", 1)[1]), q.get("price")))
         if path == "/v1/commands/cancel":
             return self._send(*SIM.cancel(ticker=q.get("ticker")))
+        if path == "/v1/leases":
+            return self._send(*SIM.lease(q.get("ticker", "")))
+        if path.startswith("/v1/leases/"):
+            return self._send(*SIM.use_lease(int(path.rsplit("/", 1)[1]), q))
         if path == "/v1/mock/convert":
             return self._send(*SIM.convert(q.get("kind", ""), int(q.get("quantity", 10000))))
         self._send(404, {"code": "NOT_FOUND", "message": path})
@@ -427,7 +493,8 @@ def run_clock(args):
     seed = args.seed
     while True:
         SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net, depth_mult=args.depth_mult,
-                  vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult)
+                  vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult,
+                  tender_min=args.tender_min, tender_max=args.tender_max)
         print(f"[mock] new heat, seed={seed}", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -445,7 +512,9 @@ def main():
     p.add_argument("--tick", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--gross", type=int, default=300_000)
-    p.add_argument("--net", type=int, default=100_000)
+    p.add_argument("--net", type=int, default=200_000)
+    p.add_argument("--tender-min", type=int, default=70_000, help="smallest tender (real server: ~72k)")
+    p.add_argument("--tender-max", type=int, default=100_000, help="largest tender (real server: ~98k)")
     p.add_argument("--depth-mult", type=float, default=1.0, help="order book depth multiplier")
     p.add_argument("--vol-mult", type=float, default=1.0, help="price volatility multiplier")
     p.add_argument("--flow-mult", type=float, default=1.0, help="how fast resting limit orders get filled")

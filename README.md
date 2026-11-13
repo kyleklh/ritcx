@@ -7,7 +7,7 @@
 | `bs.py` | Black-Scholes price, delta, gamma, vega, implied vol (no extra packages). |
 | `test_batch.sh` | Runs the vol algo against many fast mock heats and prints each P&L. |
 | `etf_algo.py` | ETF arbitrage algorithm. Settings are at the top. |
-| `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX). |
+| `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters via the lease API). |
 | `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client. |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
 
@@ -102,31 +102,38 @@ Batch test, 6 heats at 5x speed:
 
 ### What the algo does
 
-1. **Tenders**: values each one against the basket it can actually trade.
-   - Up to `URGENT_GAP` shares are hedged passively, near mid plus the rebate.
-   - The rest is valued by walking the book at market.
-   - Accepts if the edge is at least `TENDER_MIN_EDGE` per share and the limits stay below 90%.
+1. **Tenders**: real tenders are 70k to 100k RITC. Fully hedged, one share uses 4 units of gross
+   (RITC counts 2x), so a 90k tender needs 360k of gross: more than the 300k limit. The algo therefore:
+   - accepts if it can hold the tender before hedging (usage under `LIMIT_TRANSIENT_MAX`),
+   - hedges with BULL and BEAR as far as the gross limit allows (`HEDGE_USAGE_MAX`),
+   - redeems/creates hedged 10k blocks to free room for the rest (see 5),
+   - counts the converter fees ($1,500 USD per block) and a penalty for the part that waits unhedged
+     (`UNHEDGED_PENALTY`) in the tender's edge. It accepts if the edge is at least `TENDER_MIN_EDGE` per share.
    - Auction tenders get a bid priced to keep that edge.
-2. **Hedge**: keeps BULL = BEAR = -RITC.
+2. **Hedge**: keeps BULL = BEAR = -RITC, never pushing gross above `HEDGE_USAGE_MAX`.
    - Limit orders at the best price first (earning the $0.01 rebate).
    - Market orders only for the part of the gap beyond `URGENT_GAP`.
 3. **Arb**: trades RITC when RITC vs the basket is mispriced beyond fees; the hedge adds the basket legs.
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
-   - Capped at `ARB_MAX_PAIRS` to keep limit room for tenders.
+   - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
-5. **Converters**: prints `>>> CONVERTER: REDEEM/CREATE ... <<<` only when a profitable tender was declined
-   because of limits. Holding hedged pairs to the end is free, since close-out happens at the correct price,
-   so converting otherwise just costs $1,500.
+5. **Converters**: while the fully hedged book would not fit under `CONVERT_TARGET` usage, it redeems
+   (long RITC) or creates (short RITC) one hedged 10k block at a time, through the RIT lease API
+   (`POST /leases`, then `POST /leases/{id}`). If the server refuses the API calls, it prints
+   `>>> CONVERTER: REDEEM 1 x 10,000 NOW <<<` instead, and you click it in the RIT Client.
+   Set `AUTO_CONVERT=0` to always use prompts.
 
 ### Operator during the heat
 
-- Watch for `>>> CONVERTER` lines and click ETF-Redemption / ETF-Creation in the RIT Client Assets tab.
+- Watch for `CONVERT` lines. If you see `CONVERTER API NOT AVAILABLE`, click ETF-Redemption / ETF-Creation
+  in the RIT Client Assets tab each time a `>>> CONVERTER` prompt appears (one 10k block per prompt).
 - Watch `limits=` and check that BULL and BEAR stay equal to -RITC.
 - `p` / `r` to pause / resume tenders and arb (hedging continues). `s` for status, `q` to quit.
 
 ### Check once you have practice-server access
 
-- [ ] Real gross/net limits (read from `/limits`) and typical tender sizes.
+- [ ] Whether the lease API works for the converters (look for `CONVERT` vs `CONVERTER API NOT AVAILABLE`).
+- [ ] Whether a conversion takes its inputs at the start or swaps everything at the end (the algo detects this).
 - [ ] How deep the books are and how fast passive orders fill (tune `URGENT_GAP`, `TENDER_MIN_EDGE`).
 - [ ] Whether the USD position really is USD cash (the FX hedge assumes it is).
 - [ ] Tender fields (`is_fixed_bid`, `price`, `action`) match what the algo expects.
