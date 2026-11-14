@@ -206,9 +206,11 @@ def vol_for_week(w):
         return ST.vol_known[w]
     if w in ST.vol_est:
         return ST.vol_est[w]
-    for prev in range(w - 1, 0, -1):          # fall back to most recent known vol
-        if prev in ST.vol_known:
+    for prev in range(w - 1, 0, -1):          # fall back to the latest week we have ANY number for
+        if prev in ST.vol_known:               # (announced vol beats the forecast for the same week)
             return ST.vol_known[prev]
+        if prev in ST.vol_est:
+            return ST.vol_est[prev]
     return None
 
 
@@ -339,8 +341,13 @@ def trade_options(info, tick, gcap):
             if g_per and abs(book_g + g_per * q) > gcap and abs(book_g + g_per * q) > abs(book_g):
                 q = min(q, int(max(0, (gcap - abs(book_g)) / abs(g_per))))
             closing = (side == "BUY" and pos < 0) or (side == "SELL" and pos > 0)
+            against_book = (side == "BUY" and ST.book_dir < 0) or (side == "SELL" and ST.book_dir > 0)
             if closing:
                 q = min(q, abs(pos)) if q > 0 else 0
+            elif against_book and edge <= REVERSE_EDGE:
+                # this leg was admitted as a CLOSE at MIN_EDGE and is now flat: carrying on would open a
+                # position against the book, which is a reversal and needs REVERSE_EDGE
+                break
             if q <= 0 or (q < MIN_OPEN_QTY and not closing):
                 break
             filled = place(tk, side, q)
