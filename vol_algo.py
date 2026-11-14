@@ -244,15 +244,16 @@ def option_info(sec, S, T, fv):
     for k in STRIKES:
         for flag, tk in (("c", CALLS[k]), ("p", PUTS[k])):
             x = sec[tk]
-            bid, ask = float(x["bid"]), float(x["ask"])
+            bid, ask = float(x["bid"] or 0), float(x["ask"] or 0)
             mid = (bid + ask) / 2
-            iv = bs.implied_vol(flag, mid, S, k, T, RISK_FREE)
+            iv = bs.implied_vol(flag, mid, S, k, T, RISK_FREE) if bid > 0 and ask > 0 else None
             fair = bs.price(flag, S, k, T, fv, RISK_FREE)
             d_vol = iv if iv else fv
             out[tk] = {
                 "K": k, "flag": flag, "bid": bid, "ask": ask, "iv": iv, "fair": fair,
-                "buy_edge": fair - ask - OPT_FEE_PER_SHARE,
-                "sell_edge": bid - fair - OPT_FEE_PER_SHARE,
+                # an empty side quotes 0: never treat that as a price (an ask of 0 looks like a huge buy edge)
+                "buy_edge": fair - ask - OPT_FEE_PER_SHARE if ask > 0 else -1.0,
+                "sell_edge": bid - fair - OPT_FEE_PER_SHARE if bid > 0 else -1.0,
                 "delta": bs.delta(flag, S, k, T, d_vol, RISK_FREE),
                 "gamma": bs.gamma(S, k, T, d_vol, RISK_FREE),
                 "pos": int(x["position"]),
@@ -573,8 +574,9 @@ def main():
         sec = snapshot()
         if not sec:
             continue
-        S = (float(sec["RTM"]["bid"] or 0) + float(sec["RTM"]["ask"] or 0)) / 2
-        if S <= 0:                      # no quote yet (happens at tick 1 on the real server)
+        rb, ra = float(sec["RTM"]["bid"] or 0), float(sec["RTM"]["ask"] or 0)
+        S = (rb + ra) / 2 if rb > 0 and ra > 0 else float(sec["RTM"].get("last") or 0)
+        if S <= 0:                                    # no RTM quote yet (seen at t=1): nothing to price against
             time.sleep(LOOP_SLEEP)
             continue
         T = (ST.ticks - tick) / ST.tpy

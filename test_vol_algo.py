@@ -49,6 +49,16 @@ class TradeOptionsTest(unittest.TestCase):
         self.assertEqual(self.sold("RTM49C"), 400)   # 4 orders x 100
 
 
+class EmptyQuoteTest(unittest.TestCase):
+    def test_option_with_no_ask_is_not_a_buy(self):
+        sec = {tk: {"bid": 0.0, "ask": 0.0, "position": 0} for tk in va.OPTIONS}
+        sec["RTM50C"] = {"bid": 1.0, "ask": 0.0, "position": 0}
+        info = va.option_info(sec, 50.0, 0.08, 0.26)
+        self.assertLess(info["RTM50C"]["buy_edge"], 0)
+        self.assertLess(info["RTM48P"]["buy_edge"], 0)
+        self.assertIsNone(info["RTM50C"]["iv"])
+
+
 class FairVolTest(unittest.TestCase):
     def setUp(self):
         va.ST.reset()
