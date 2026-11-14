@@ -73,6 +73,19 @@ Live commands (type + Enter):
    - Book gamma capped (`GAMMA_Z`) so a single tick move cannot breach the 7000 limit.
 5. Closes all options in the last `CLOSE_TICKS_BEFORE_END` ticks.
 
+### Is a change better? Replay your real heats
+
+Every heat leaves a `vol_log_*.csv` (and `news_raw_*.txt`) in the folder you ran from. Keep them: the
+market maker prices all options at one vol, so RTM's price and that vol per tick rebuild every quote,
+and two versions of the algo can be compared on the exact market you traded.
+
+    mkdir -p logs/heatA          # one folder per heat: its vol_log_*.csv (+ news_raw_*.txt if you have it)
+    python replay_compare.py logs/heatA logs/heatB --refs main WORKTREE --repeats 4
+
+`--refs` are git refs (or `WORKTREE` for the files on disk). Look at the per-heat difference, not totals:
+one heat's P&L swings about +-$5k on tiny quote changes, so judge on several heats. A log holding several
+heats (tick drops back to 1) must be split first. Without a news file the news is inferred from `fair_vol`.
+
 ### Check once you have practice-server access
 
 - [ ] Exact wording of the vol news (the parser expects "will be 20%" and "between 27% and 30%").
