@@ -42,7 +42,7 @@ def checkout(ref, tmp):
     return path
 
 
-def run_batch(jobs, tick):
+def run_batch(jobs, tick, loop_sleep):
     """jobs: [(label, heat, code_dir, csv, news)] run in parallel; returns [(label, heat, pnl, fees, pen, live)]."""
     procs = []
     for j, (label, heat, code, csv_path, news, rep) in enumerate(jobs):
@@ -56,7 +56,7 @@ def run_batch(jobs, tick):
     algos = []
     for label, heat, code, port, srv in procs:
         wd = tempfile.mkdtemp(prefix="replay_")
-        env = dict(os.environ, RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP="0.05")
+        env = dict(os.environ, RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
         algos.append(subprocess.Popen([sys.executable, os.path.join(code, "vol_algo.py")], cwd=wd, env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     out = []
@@ -81,6 +81,8 @@ def main():
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--parallel", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--tick", type=float, default=0.2, help="seconds per replayed tick (1.0 = real speed)")
+    ap.add_argument("--loop-sleep", type=float, default=None,
+                    help="algo LOOP_SLEEP; default scales with --tick so loops per tick match live (0.2s at 1s/tick)")
     a = ap.parse_args()
     files = {h: heat_files(h) for h in a.heats}
     tmp = tempfile.mkdtemp(prefix="replay_refs_")
@@ -92,7 +94,7 @@ def main():
         jobs = [(r, h, codes[r]) + files[h] + (k,) for k in range(a.repeats) for h in a.heats for r in a.refs]
         res = []
         for i in range(0, len(jobs), a.parallel):
-            res += run_batch(jobs[i:i + a.parallel], a.tick)
+            res += run_batch(jobs[i:i + a.parallel], a.tick, a.loop_sleep if a.loop_sleep is not None else 0.25 * a.tick)
             print(f"  {min(i + a.parallel, len(jobs))}/{len(jobs)} runs done", flush=True)
     finally:
         for r, path in codes.items():
