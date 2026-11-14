@@ -52,9 +52,8 @@ LIMIT_TRANSIENT_MAX = 0.97    # max usage right after accepting a tender, before
 HEDGE_USAGE_MAX = 0.96        # hedge orders never push gross usage above this (converters free the rest)
 
 # Hedging: passive first (limit orders earn the rebate), market orders only for risk above URGENT_GAP
-URGENT_GAP = 10000            # max unhedged shares per leg we tolerate; anything beyond is hedged at market
-THIN_BOOK = 2500              # if fewer shares than this sit at the best price, the book is "thin":
-THIN_GAP_MULT = 2.0           # ...tolerate URGENT_GAP x this before hitting it with market orders
+URGENT_GAP = 5000             # max unhedged shares per leg we tolerate; anything beyond is hedged at market
+STALL_TICKS = 5               # if a leg's gap hasn't closed passively after this many ticks, close it at market
 HEDGE_SLIP = 0.03             # market hedges only take liquidity within this distance of the best price
 HEDGE_MIN = 100               # ignore smaller imbalances
 REBATE = 0.01
@@ -102,6 +101,7 @@ class State:
     seen_tenders = set()
     last_tick = -1
     acted_tick = -1
+    gap_since = {}        # leg -> tick its hedge gap opened
     last_prompt_tick = -100
     last_slow_warn = -100
     flush_tick = 0
@@ -240,6 +240,18 @@ def depth_within(levels, slip):
     return sum(sz for px, sz in levels if abs(px - best) <= slip + 1e-9)
 
 
+MAX_SANE_EDGE = 1.0           # CAD/share; anything bigger means a quote is broken, not an opportunity
+
+
+def quotes_ok(q):
+    """Every bid/ask we use is a real price (no zeros, no crossed books)."""
+    for t in ("USD", "RITC", "BULL", "BEAR"):
+        b, a = q.get(t, (0, 0))
+        if b <= 0 or a <= 0 or a < b:
+            return False
+    return True
+
+
 def usage(pos, gl, nl, d_ritc=0, d_bull=0, d_bear=0):
     b, e, r = pos.get("BULL", 0) + d_bull, pos.get("BEAR", 0) + d_bear, pos.get("RITC", 0) + d_ritc
     gross = abs(b) + abs(e) + 2 * abs(r)
@@ -292,6 +304,8 @@ def evaluate_tender(t, snap):
     Edge = tender price vs the basket we will sell/buy to hedge, minus converter fees for the blocks
     we must convert to fit the hedge in our limits, minus a penalty for the part that waits unhedged."""
     q, act = int(t["quantity"]), t["action"]
+    if not quotes_ok(snap["q"]):
+        return 0.0, None, "quotes missing or broken right now"
     bk, (ub, ua) = snap["books"], snap["q"]["USD"]
     mids = {k: sum(snap["q"][k]) / 2 for k in ("BULL", "BEAR")}
     usd = (ub + ua) / 2 or 1.0
@@ -407,10 +421,14 @@ def hedge(snap, tick, orders=None, passive=True):
         toward_zero = min(abs(gap), abs(p0)) if p0 * gap < 0 else 0
         gap = int(math.copysign(min(abs(gap), toward_zero + leg_room), gap)) if gap else 0
         side = "BUY" if gap > 0 else "SELL"
-        # 1) urgent part at market (a thin book gets more patience: market orders there cost a lot)
-        top = (bk[leg]["asks"] if gap > 0 else bk[leg]["bids"])
-        top_size = top[0][1] if top else 0
-        tolerance = URGENT_GAP * (THIN_GAP_MULT if top_size < THIN_BOOK else 1.0)
+        # 1) urgent part at market. A gap that the passive order hasn't filled for STALL_TICKS goes to
+        #    market too (only liquidity within HEDGE_SLIP), so exposure never sits open for long.
+        if abs(gap) >= HEDGE_MIN:
+            since = ST.gap_since.setdefault(leg, tick)
+        else:
+            ST.gap_since.pop(leg, None)
+            since = tick
+        tolerance = 0 if tick - since >= STALL_TICKS else URGENT_GAP
         urgent = abs(gap) - tolerance
         if urgent >= HEDGE_MIN:
             levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
@@ -458,8 +476,12 @@ def arb(snap, tick):
     rb, ra = q["RITC"]
     bull_b, bull_a = q["BULL"]
     bear_b, bear_a = q["BEAR"]
+    if not quotes_ok(q):
+        return False
     sell_etf = rb * ub - (bull_a + bear_a) - 3 * FEE    # sell RITC, buy basket
     buy_etf = (bull_b + bear_b) - ra * ua - 3 * FEE     # buy RITC, sell basket
+    if max(sell_etf, buy_etf) > MAX_SANE_EDGE:
+        return False                     # a price is stale/missing (e.g. at tick 0): not a real edge
     r = pos.get("RITC", 0)
     gl, nl = snap["gross_limit"], snap["net_limit"]
     size = min(ARB_CLIP, bk["RITC"]["bids"][0][1] if bk["RITC"]["bids"] else 0,
@@ -593,7 +615,7 @@ def main():
             banner("NEW HEAT")
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
-            ST.conv_busy_until, ST.conv_prompts, ST.inflight = -1, 0, {}
+            ST.conv_busy_until, ST.conv_prompts, ST.inflight, ST.gap_since = -1, 0, {}, {}
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
