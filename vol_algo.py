@@ -566,7 +566,10 @@ def main():
         sec = snapshot()
         if not sec:
             continue
-        S = (float(sec["RTM"]["bid"]) + float(sec["RTM"]["ask"])) / 2
+        S = (float(sec["RTM"]["bid"] or 0) + float(sec["RTM"]["ask"] or 0)) / 2
+        if S <= 0:                      # no quote yet (happens at tick 1 on the real server)
+            time.sleep(LOOP_SLEEP)
+            continue
         T = (ST.ticks - tick) / ST.tpy
         fv = fair_vol(tick)
         if fv is None:
