@@ -50,7 +50,9 @@ MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
 MAX_GROSS_CONTRACTS = 2400    # case limit 2500 gross
 
 HEDGE_TRIGGER = 2000          # re-hedge when |delta| > this (case limit 7000)
-GAMMA_Z = float(os.environ.get("GAMMA_Z", 2.0))                # size the book so a GAMMA_Z-sigma one-tick move can't push delta past the limit.
+GAMMA_Z = float(os.environ.get("GAMMA_Z", 1.5))                # size the book so a GAMMA_Z-sigma one-tick move can't push delta past the limit.
+                              # 1.5 beat 2.0 by ~$5k/heat on the mock (MM half-life 5-10); 1.0 and 0.75 added
+                              # penalty (up to $5k in a heat) with no extra profit.
                               # Higher = safer/smaller. Gamma grows near expiry, so this shrinks size automatically.
 HEDGE_TARGET = 0
 RTM_MAX_ORDER = 10000
@@ -206,11 +208,9 @@ def vol_for_week(w):
         return ST.vol_known[w]
     if w in ST.vol_est:
         return ST.vol_est[w]
-    for prev in range(w - 1, 0, -1):          # fall back to the latest week we have ANY number for
-        if prev in ST.vol_known:               # (announced vol beats the forecast for the same week)
-            return ST.vol_known[prev]
-        if prev in ST.vol_est:
-            return ST.vol_est[prev]
+    for prev in range(w - 1, 0, -1):          # fall back to most recent KNOWN vol. Tested falling back to the
+        if prev in ST.vol_known:               # latest forecast instead: it traded earlier on the forecast and
+            return ST.vol_known[prev]          # lost $1.5-6.9k/heat on the mock (more pre-boundary carry).
     return None
 
 

@@ -53,12 +53,13 @@ class FairVolTest(unittest.TestCase):
     def setUp(self):
         va.ST.reset()
 
-    def test_unknown_week_uses_latest_forecast(self):
-        # Run 1, t=115: week 2 known 33%, week 3 forecast 23.5%, week 4 unknown.
+    def test_unknown_week_uses_latest_known(self):
+        # Run 1, t=115: week 2 known 33%, week 3 forecast 23.5%, week 4 unknown -> 33% (kept on purpose,
+        # see vol_for_week). Fair vol matches the 29.5% the live log printed.
         va.ST.vol_known = {1: 0.30, 2: 0.33}
         va.ST.vol_est = {3: 0.235}
-        self.assertAlmostEqual(va.vol_for_week(4), 0.235)
-        self.assertAlmostEqual(va.fair_vol(115), 0.2557, places=3)   # was 29.5% (week 4 assumed 33%)
+        self.assertAlmostEqual(va.vol_for_week(4), 0.33)
+        self.assertAlmostEqual(va.fair_vol(115), 0.2952, places=3)
 
     def test_known_beats_estimate(self):
         va.ST.vol_known = {2: 0.33, 3: 0.23}
