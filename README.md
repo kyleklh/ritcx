@@ -117,6 +117,13 @@ Batch test, 6 heats at 5x speed:
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
+7. **Two exit routes for tenders**: part of a tender (up to `RITC_ROUTE_MAX`) can go straight back into the RITC
+   book (1 trade, 1 fee, no converters) instead of being hedged with BULL+BEAR. The tender valuation tries a few
+   splits and keeps the best; whatever the RITC route hasn't done after `RITC_ROUTE_TICKS` is hedged with stocks.
+   No new tender is accepted while the last one is still being worked.
+8. **Competition**: `CROWD_SHARE` (default 0.5) assumes other teams take half of the visible book, so tenders are
+   only accepted if they still pay when everyone hedges at once. Use `CROWD_SHARE=1.0` to value as if alone.
+   Test with competitors on the mock: `MOCK_ARGS="--crowd 3" ./test_etf_batch.sh 8 201`.
 6. **Late fills**: the real server can show a fill in `/securities` a moment after the order returns. After a
    market order the algo does not trade that ticker again until the fill shows (or `INFLIGHT_TIMEOUT` passes),
    and it resizes resting orders and the FX hedge once per tick. Without this, a slow server makes the hedges

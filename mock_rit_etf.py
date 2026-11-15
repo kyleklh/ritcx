@@ -40,7 +40,7 @@ CONVERT_COST_USD = 1500.0
 class Sim:
     def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=200_000,
                  depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0,
-                 tender_min=70_000, tender_max=100_000, pos_lag=0.0):
+                 tender_min=70_000, tender_max=100_000, pos_lag=0.0, crowd=0, crowd_impact=1.0):
         self.rng = random.Random(seed)
         r = self.rng
         self.ticks = ticks
@@ -74,6 +74,14 @@ class Sim:
         self.tender_min, self.tender_max = tender_min, tender_max
         # Reported positions lag the real ones by pos_lag seconds (the real server can be slow to show fills)
         self.pos_lag = pos_lag
+        # Other teams (the competition): they get the same tenders, accept the good ones and hedge them in
+        # the same books over the next few ticks (pushing prices against us), and they arb RITC vs the basket
+        # too (shocks close faster). crowd = number of competing teams.
+        self.crowd, self.crowd_impact = crowd, crowd_impact
+        self.crowd_rng = random.Random((seed or 0) + 99991)
+        self.crowd_flow = []      # [ticks_left, {ticker: signed shares per tick}]
+        if crowd:
+            self.shock_decay = 0.93 ** (1 + 0.5 * crowd)
         self.pos_hist = []        # (time, copy of positions) after every change
         # converters: each use takes CONVERT_TICKS; inputs leave at the start, outputs arrive at the end
         self.conv = {"redeem": {"busy_until": 0, "outputs": None}, "create": {"busy_until": 0, "outputs": None}}
@@ -188,6 +196,7 @@ class Sim:
             self.shock *= self.shock_decay
             if r.random() < 0.04:
                 self.shock += r.choice([-1, 1]) * r.uniform(0.08, 0.30) * self.shock_mult
+            self._crowd_trades()
             self._fill_limit_orders()
             self._finish_conversions()
             self._tenders()
@@ -239,6 +248,32 @@ class Sim:
                    "price": px if fixed else None}
             tdr["_reserve"] = px
             self.tenders.append(tdr)
+            self._crowd_takes(action, qty, gift)
+
+    def _crowd_takes(self, action, qty, gift):
+        """Competing teams accept this tender too (most of them if it's good) and hedge it over 6 ticks:
+        70% through BULL+BEAR, 30% back into RITC."""
+        if not self.crowd:
+            return
+        cr = self.crowd_rng
+        takers = sum(1 for _ in range(self.crowd) if cr.random() < (0.7 if gift > 0.05 else 0.2))
+        if not takers:
+            return
+        shares = takers * qty
+        side = 1 if action == "BUY" else -1          # they now hold side*shares RITC; hedge = opposite flow
+        ticks = 6
+        per = {"BULL": -side * 0.7 * shares / ticks, "BEAR": -side * 0.7 * shares / ticks,
+               "RITC": -side * 0.3 * shares / ticks}
+        self.crowd_flow.append([ticks, per])
+
+    def _crowd_trades(self):
+        """Apply the competitors' hedge flow: it moves prices like our own market orders do."""
+        for f in self.crowd_flow:
+            f[0] -= 1
+            for t, sh in f[1].items():
+                d = self.depth[t]
+                self.disp[t] += (sh / d) * self.level_step[t] * 0.6 * self.crowd_impact
+        self.crowd_flow = [f for f in self.crowd_flow if f[0] > 0]
 
     def accept_tender(self, tid, price):
         with self.lock:
@@ -475,7 +510,8 @@ def run_clock(args):
     while True:
         SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net, depth_mult=args.depth_mult,
                   vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult,
-                  tender_min=args.tender_min, tender_max=args.tender_max, pos_lag=args.pos_lag)
+                  tender_min=args.tender_min, tender_max=args.tender_max, pos_lag=args.pos_lag,
+                  crowd=args.crowd, crowd_impact=args.crowd_impact)
         print(f"[mock] new heat, seed={seed}", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -503,6 +539,8 @@ def main():
     p.add_argument("--shock-mult", type=float, default=1.0, help="size of RITC-vs-basket shocks")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--pos-lag", type=float, default=0.0, help="seconds the reported positions lag real fills")
+    p.add_argument("--crowd", type=int, default=0, help="number of competing teams taking and hedging the same tenders")
+    p.add_argument("--crowd-impact", type=float, default=1.0, help="how hard their hedging moves prices")
     p.add_argument("--loop", action="store_true")
     args = p.parse_args()
     global SIM

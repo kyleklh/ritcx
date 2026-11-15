@@ -44,6 +44,11 @@ MAX_FX_ORDER = 2_500_000
 TENDER_MIN_EDGE = 0.04        # CAD/share profit required after hedge cost + fees
 TENDER_MIN_PROFIT = 500       # CAD total; skip tiny wins
 UNHEDGED_PENALTY = 0.03       # CAD/share charged on the part we cannot hedge right away (waits for converters)
+RITC_ROUTE_SPLITS = (0.0, 0.25, 0.5)   # fractions of a tender we may trade straight back into the RITC book
+RITC_ROUTE_MAX = 40000        # never more than this via RITC (its book is thinner)
+RITC_ROUTE_TICKS = 10         # whatever is left of that after this many ticks gets hedged with BULL+BEAR
+CROWD_SHARE = float(os.environ.get("CROWD_SHARE", "0.5"))   # share of the visible book we expect to get.
+                              # 0.5 = assume other teams take half (competition). 1.0 = alone
 REFILL_PENALTY = 0.02         # CAD/share for hedge shares that must wait for the book to refill
 EVAL_SLICE = 20000            # walk the book for this many shares; assume patience for the rest
 EXTRA_SLIP_BEYOND_SLICE = 0.01  # extra CAD/share assumed on shares beyond the slice
@@ -102,6 +107,9 @@ class State:
     last_tick = -1
     acted_tick = -1
     gap_since = {}        # leg -> tick its hedge gap opened
+    last_ritc_route = 0   # shares of the tender being evaluated that would go back into RITC
+    ritc_plan = 0         # signed RITC still to trade back into the RITC book (part of a tender)
+    plan_until = -1
     last_prompt_tick = -100
     last_slow_warn = -100
     flush_tick = 0
@@ -153,8 +161,9 @@ def check_inflight(pos):
     """Clear a ticker once /securities shows our fill (or after the timeout). Never edits positions."""
     now = time.time()
     for tk, f in list(ST.inflight.items()):
-        moved = (pos.get(tk, 0) - f["base"]) * (1 if f["total"] > 0 else -1)
-        if moved >= 0.9 * abs(f["total"]) or now - f["t"] > INFLIGHT_TIMEOUT:
+        # cleared only when the server shows ALL our fills (orders in both directions can be pending at once)
+        unseen = f["total"] - (pos.get(tk, 0) - f["base"])
+        if abs(unseen) <= max(100, 0.02 * abs(f["total"])) or now - f["t"] > INFLIGHT_TIMEOUT:
             del ST.inflight[tk]
 
 
@@ -273,7 +282,7 @@ def leg_value(levels, mid, q, sgn):
         if not levels:
             return mid + sgn * (FEE + 0.10)         # empty book: assume it's expensive
         best = levels[0][0]
-        near = [(px, sz) for px, sz in levels if abs(px - best) <= HEDGE_SLIP + 1e-9]
+        near = [(px, sz * CROWD_SHARE) for px, sz in levels if abs(px - best) <= HEDGE_SLIP + 1e-9]
         avail = sum(sz for _, sz in near)
         take = min(qm, avail)
         got, cost = 0, 0.0
@@ -285,7 +294,8 @@ def leg_value(levels, mid, q, sgn):
             got += k
         vwap = cost / got if got else best
         later = qm - take                            # waits for the book to refill
-        total += qm * (vwap + sgn * FEE) + later * sgn * REFILL_PENALTY
+        # others hedging the same tender push the price: charge the refill wait more when crowded
+        total += qm * (vwap + sgn * FEE) + later * sgn * REFILL_PENALTY / max(CROWD_SHARE, 0.1)
     return total / q
 
 
@@ -324,31 +334,48 @@ def evaluate_tender(t, snap):
             limit_block = "limits (converters cannot make enough room)"
     if limit_block:
         pos = {}          # still value it, as if we were flat, so the log shows what the refusal cost
-    n_conv = blocks_to_convert(pos, gl, nl, d_ritc=side * q)
-    new_r = pos.get("RITC", 0) + side * q
-    # shares of each leg we can hedge right away; the rest waits for converters
-    g_now = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(new_r)
-    hedge_now = max(0.0, min(q, (HEDGE_USAGE_MAX * gl - g_now) / 2))
-    waiting = q - hedge_now
-    extra = (n_conv * CONVERT_FEE_USD * usd) / q + UNHEDGED_PENALTY * waiting / q   # CAD per tender share
-    if act == "BUY":      # we buy RITC, hedge by SELLING the basket (receive this per share)
-        basket = leg_value(bk["BULL"]["bids"], mids["BULL"], q, -1) + leg_value(bk["BEAR"]["bids"], mids["BEAR"], q, -1)
-        breakeven_usd = (basket - extra - TENDER_MIN_EDGE) / usd
-        edge = basket - extra - (px * usd if px else breakeven_usd * usd + TENDER_MIN_EDGE)
-        bid = math.floor(breakeven_usd * 100) / 100
-    else:                 # we sell RITC, hedge by BUYING the basket (pay this per share)
-        basket = leg_value(bk["BULL"]["asks"], mids["BULL"], q, 1) + leg_value(bk["BEAR"]["asks"], mids["BEAR"], q, 1)
-        breakeven_usd = (basket + extra + TENDER_MIN_EDGE) / usd
-        edge = (px * usd if px else breakeven_usd * usd - TENDER_MIN_EDGE) - basket - extra
-        bid = math.ceil(breakeven_usd * 100) / 100
-    note = f"{n_conv} conversion{'s' if n_conv != 1 else ''}"
+    # Two ways to get flat: hedge with BULL+BEAR (2 trades, 2 fees, maybe converters), or trade part of the
+    # tender straight back into the RITC book (1 trade, 1 fee, no converters). Try a few splits, keep the best.
+    rmid = sum(snap["q"]["RITC"]) / 2
+    best = None
+    for frac in RITC_ROUTE_SPLITS:
+        x = int(min(frac * q, RITC_ROUTE_MAX))
+        qs = q - x
+        new_r = pos.get("RITC", 0) + side * (q - x)
+        n_conv = blocks_to_convert(pos, gl, nl, d_ritc=side * (q - x))
+        # shares of each leg we can hedge right away; the rest waits for converters
+        g_now = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(new_r)
+        hedge_now = max(0.0, min(qs, (HEDGE_USAGE_MAX * gl - g_now) / 2))
+        waiting = qs - hedge_now
+        extra = (n_conv * CONVERT_FEE_USD * usd) / q + UNHEDGED_PENALTY * waiting / q   # CAD per tender share
+        if act == "BUY":   # we bought RITC: sell the basket for qs shares, sell x RITC back
+            stock = (leg_value(bk["BULL"]["bids"], mids["BULL"], qs, -1)
+                     + leg_value(bk["BEAR"]["bids"], mids["BEAR"], qs, -1)) if qs else 0.0
+            ritc = leg_value(bk["RITC"]["bids"], rmid, x, -1) * usd if x else 0.0
+            value = (qs * stock + x * ritc) / q                       # CAD received per tender share
+            breakeven_usd = (value - extra - TENDER_MIN_EDGE) / usd
+            edge = value - extra - (px * usd if px else breakeven_usd * usd + TENDER_MIN_EDGE)
+            bid = math.floor(breakeven_usd * 100) / 100
+        else:              # we sold RITC: buy the basket for qs shares, buy x RITC back
+            stock = (leg_value(bk["BULL"]["asks"], mids["BULL"], qs, 1)
+                     + leg_value(bk["BEAR"]["asks"], mids["BEAR"], qs, 1)) if qs else 0.0
+            ritc = leg_value(bk["RITC"]["asks"], rmid, x, 1) * usd if x else 0.0
+            value = (qs * stock + x * ritc) / q                       # CAD paid per tender share
+            breakeven_usd = (value + extra + TENDER_MIN_EDGE) / usd
+            edge = (px * usd if px else breakeven_usd * usd - TENDER_MIN_EDGE) - value - extra
+            bid = math.ceil(breakeven_usd * 100) / 100
+        if best is None or edge > best[0]:
+            best = (edge, bid, x, n_conv, extra, value)
+    edge, bid, x, n_conv, extra, basket = best
+    ST.last_ritc_route = x
+    note = f"{n_conv} conversion{'s' if n_conv != 1 else ''}" + (f", {x:,} back into RITC" if x else "")
     # breakdown for the log: where the edge goes (all CAD per share)
     mid_basket = mids["BULL"] + mids["BEAR"]
     leg = "bids" if act == "BUY" else "asks"
     top = lambda t: (bk[t][leg][0][1] if bk[t][leg] else 0)
     depth = lambda t: sum(sz for _, sz in bk[t][leg][:10])
     ST.last_detail = (f"tender {px * usd if px else float('nan'):.3f} CAD vs basket mid {mid_basket:.3f} | "
-                      f"hedge cost {abs(mid_basket - basket):.3f} | converters+wait {extra:.3f} | "
+                      f"hedge cost {abs(mid_basket - basket):.3f} (incl. {x:,} via RITC) | converters+wait {extra:.3f} | "
                       f"BULL top/10lvl {top('BULL'):,}/{depth('BULL'):,}  BEAR {top('BEAR'):,}/{depth('BEAR'):,}")
     if limit_block:
         return edge, None, f"{limit_block}; edge if we had been flat {edge:+.3f}/sh = ${edge * q:,.0f}"
@@ -357,6 +384,50 @@ def evaluate_tender(t, snap):
             return edge, None, f"edge too small, after {note}"
         return edge, None, f"ok, {note}"
     return edge, bid, f"auction, {note}"
+
+
+def still_hedging(snap):
+    """Why we're not ready for another tender ('' if we are): RITC route or a big hedge gap still open."""
+    if ST.ritc_plan:
+        return f"{abs(ST.ritc_plan):,.0f} RITC still going back into its book"
+    pos = snap["pos"]
+    target = -(pos.get("RITC", 0) + ST.ritc_plan)
+    gap = max(abs(target - pos.get(l, 0)) for l in ("BULL", "BEAR"))
+    if gap > 2 * URGENT_GAP:
+        return f"hedge gap {gap:,.0f}"
+    return ""
+
+
+def plan_ritc_route(act, tick):
+    """After accepting: trade ST.last_ritc_route shares straight back into the RITC book."""
+    x = ST.last_ritc_route
+    if x:
+        ST.ritc_plan += -x if act == "BUY" else x
+        ST.plan_until = tick + RITC_ROUTE_TICKS
+
+
+def ritc_route(snap, tick):
+    """Work the RITC part of a tender back into the RITC book (market orders within HEDGE_SLIP).
+    Anything left after RITC_ROUTE_TICKS is handed to the BULL+BEAR hedge instead."""
+    if not ST.ritc_plan:
+        return
+    if tick > ST.plan_until:
+        event(tick, "RITC", f"route timed out with {ST.ritc_plan:+,.0f} left: hedging that with BULL+BEAR")
+        ST.ritc_plan = 0
+        return
+    if busy("RITC") or not quotes_ok(snap["q"]):
+        return
+    levels = snap["books"]["RITC"]["bids" if ST.ritc_plan < 0 else "asks"]
+    avail = max(levels[0][1] if levels else 0, depth_within(levels, HEDGE_SLIP))
+    qty = int(min(abs(ST.ritc_plan), MAX_EQ_ORDER, avail))
+    if qty < HEDGE_MIN:
+        return
+    side = "SELL" if ST.ritc_plan < 0 else "BUY"
+    f = market("RITC", side, qty, snap["pos"].get("RITC", 0))
+    if f:
+        ST.ritc_plan += f if side == "SELL" else -f
+        a = ST.arb_acc.setdefault(f"TENDER via RITC book: {side.lower()} RITC", [0, 0])
+        a[0] += f
 
 
 def handle_tenders(snap, tick):
@@ -372,6 +443,9 @@ def handle_tenders(snap, tick):
         ST.last_detail = ""
         say(f"[tender raw] {t}")
         edge, bid, why = evaluate_tender(t, snap)
+        working = still_hedging(snap)
+        if working and (why.startswith("ok") or why.startswith("auction")):
+            why = f"still hedging the last tender ({working}); edge was {edge:+.3f}/sh"
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
         if why.startswith("ok"):
@@ -379,8 +453,11 @@ def handle_tenders(snap, tick):
             ok = r is not None and r.ok and r.json().get("success", True)
             if ok:
                 note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
+                plan_ritc_route(act, tick)
             event(tick, "TENDER", f"ACCEPT  {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}  ({why[4:]})"
                   + ("" if ok else "  (FAILED)"))
+            if ST.last_detail:
+                event(tick, "  why", ST.last_detail)
             if ok:
                 return True
         elif why.startswith("auction"):
@@ -388,6 +465,7 @@ def handle_tenders(snap, tick):
             ok = r is not None and r.ok and r.json().get("success", True)
             if ok:
                 note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
+                plan_ritc_route(act, tick)
             event(tick, "TENDER", f"BID     {desc}  our bid {bid:.2f}  -> {'WON' if ok else 'lost'}")
             if ok:
                 return True
@@ -407,11 +485,12 @@ def open_orders():
 def hedge(snap, tick, orders=None, passive=True):
     """Target BULL = BEAR = -RITC. Gap beyond URGENT_GAP -> market now. Rest -> limit order at our best price."""
     pos, bk, q = effective_pos(snap), snap["books"], snap["q"]
-    target = -pos.get("RITC", 0)
+    target = -(pos.get("RITC", 0) + ST.ritc_plan)     # RITC still going back into its own book needs no hedge
     orders = open_orders() if orders is None else orders
     did = False
     gross = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(pos.get("RITC", 0))
     leg_room = max(0.0, (HEDGE_USAGE_MAX * snap["gross_limit"] - gross) / 2)   # gross we may add, per leg
+    raw_gap = {l: target - pos.get(l, 0) for l in ("BULL", "BEAR")}
     for leg in ("BULL", "BEAR"):
         if busy(leg, "RITC"):
             continue              # last fill not visible yet: wait rather than act on a stale position
@@ -430,6 +509,10 @@ def hedge(snap, tick, orders=None, passive=True):
             since = tick
         tolerance = 0 if tick - since >= STALL_TICKS else URGENT_GAP
         urgent = abs(gap) - tolerance
+        # keep the legs in step: don't let this leg get more than URGENT_GAP ahead of the other one
+        other = raw_gap["BEAR" if leg == "BULL" else "BULL"]
+        if other * gap > 0:
+            urgent = min(urgent, abs(gap) - max(0.0, abs(other) - URGENT_GAP))
         if urgent >= HEDGE_MIN:
             levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
             avail = max(levels[0][1] if levels else 0, depth_within(levels, HEDGE_SLIP))
@@ -560,10 +643,10 @@ def converters(snap, tick):
     if tick < ST.conv_busy_until or tick > ticks_total - CONVERT_STOP_BEFORE_END:
         return
     pos, gl, nl = snap["pos"], snap["gross_limit"], snap["net_limit"]
-    need = blocks_to_convert(pos, gl, nl)
+    need = blocks_to_convert(pos, gl, nl, d_ritc=ST.ritc_plan)
     if need == 0:
         return
-    r = pos.get("RITC", 0)
+    r = pos.get("RITC", 0) + ST.ritc_plan
     sgn = 1 if r > 0 else -1
     hedged = min(abs(r), max(0.0, -sgn * pos.get("BULL", 0)), max(0.0, -sgn * pos.get("BEAR", 0)))
     if hedged < CONVERT_BLOCK:
@@ -616,6 +699,7 @@ def main():
             ST.seen_tenders = set()
             ST.last_prompt_tick = -100
             ST.conv_busy_until, ST.conv_prompts, ST.inflight, ST.gap_since = -1, 0, {}, {}
+            ST.ritc_plan, ST.plan_until = 0, -1
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -630,6 +714,7 @@ def main():
             continue
         if handle_tenders(snap, tick):
             snap = snapshot_at(tick, ticks) or snap
+        ritc_route(snap, tick)
         converters(snap, tick)
         first_of_tick = tick != ST.acted_tick      # slow decisions (resting orders, FX) once per tick
         ST.acted_tick = tick
