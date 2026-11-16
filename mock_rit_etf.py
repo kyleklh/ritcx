@@ -9,9 +9,11 @@ Approximates the case so you can develop without practice-server access:
   - Market fee $0.02/share. Max order 10,000 (equities). RITC counts 2x for limits.
   - Private tender offers (fixed price, and some competitive auctions) for RITC
   - Close-out at end at the CORRECT price (RITC valued at (BULL+BEAR)/USD)
-  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000). In the competition they are HUMAN ONLY
-    (clicked in the RIT Client). Here a MOCK-ONLY endpoint stands in for that click:
-    python convert.py redeem   (each use takes 2 ticks; inputs leave at the start, outputs arrive at the end)
+  - Converters (ETF-Creation/Redemption, $1,500 USD per 10,000; each use takes 2 ticks, inputs leave at the
+    start, outputs arrive at the end), two ways:
+      * the RIT lease API, as the algo uses it: POST /leases?ticker=ETF-Redemption, then
+        POST /leases/{id}?from1=RITC&quantity1=10000&from2=USD&quantity2=1500
+      * a MOCK-ONLY endpoint standing in for a click in the RIT Client: python convert.py redeem
   - Limits and tender sizes match the practice-server reports: gross 300k, net 200k, tenders 70k-100k
 
 Depth, spreads, tender discounts and shocks are still guesses.
@@ -86,6 +88,7 @@ class Sim:
         # converters: each use takes CONVERT_TICKS; inputs leave at the start, outputs arrive at the end
         self.conv = {"redeem": {"busy_until": 0, "outputs": None}, "create": {"busy_until": 0, "outputs": None}}
         self.conversions = 0
+        self.leased = set()
         self.last = {t: self.mid(t) for t in ["BULL", "BEAR", "RITC", "USD"]}
 
     # ---------- prices ----------
@@ -332,6 +335,29 @@ class Sim:
     }
     CONVERT_TICKS = 2
 
+    LEASE_IDS = {"ETF-Redemption": (1, "redeem"), "ETF-Creation": (2, "create")}
+    PARAM_INPUTS = {"redeem": {"RITC": 10000.0, "USD": 1500.0},
+                    "create": {"BULL": 10000.0, "BEAR": 10000.0, "USD": 1500.0}}
+
+    def leases_view(self):
+        return [{"id": i, "ticker": t} for t, (i, _) in self.LEASE_IDS.items() if t in self.leased]
+
+    def lease(self, ticker):
+        with self.lock:
+            if ticker not in self.LEASE_IDS:
+                return 400, {"code": "INVALID", "message": f"Unknown asset {ticker}"}
+            self.leased.add(ticker)
+            return 200, {"id": self.LEASE_IDS[ticker][0], "ticker": ticker}
+
+    def use_lease(self, lid, params):
+        kind = next((k for t, (i, k) in self.LEASE_IDS.items() if i == lid and t in self.leased), None)
+        if not kind:
+            return 404, {"code": "NOT_FOUND", "message": "No such lease"}
+        given = {params[f"from{i}"]: float(params.get(f"quantity{i}", 0)) for i in (1, 2, 3) if f"from{i}" in params}
+        if given != self.PARAM_INPUTS[kind]:
+            return 400, {"code": "INVALID", "message": f"Inputs must be {self.PARAM_INPUTS[kind]}"}
+        return self.convert(kind, 10000)
+
     def _finish_conversions(self):
         for c in self.conv.values():
             if c["outputs"] and self.tick >= c["busy_until"]:
@@ -472,6 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, [o for o in s.orders if o["status"] == st])
             if path == "/v1/news":
                 return self._send(200, [])
+            if path == "/v1/leases":
+                return self._send(200, s.leases_view())
         self._send(404, {"code": "NOT_FOUND", "message": path})
 
     def do_POST(self):
@@ -489,6 +517,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(*SIM.accept_tender(int(path.rsplit("/", 1)[1]), q.get("price")))
         if path == "/v1/commands/cancel":
             return self._send(*SIM.cancel(ticker=q.get("ticker")))
+        if path == "/v1/leases":
+            return self._send(*SIM.lease(q.get("ticker", "")))
+        if path.startswith("/v1/leases/"):
+            return self._send(*SIM.use_lease(int(path.rsplit("/", 1)[1]), q))
         if path == "/v1/mock/convert":
             return self._send(*SIM.convert(q.get("kind", ""), int(q.get("quantity", 10000))))
         self._send(404, {"code": "NOT_FOUND", "message": path})
