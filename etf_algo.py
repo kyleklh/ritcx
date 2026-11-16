@@ -149,7 +149,8 @@ class State:
     conv_busy_until = -1  # tick before which we don't start/prompt another conversion
     conv_prompts = 0
     auto_convert = AUTO_CONVERT
-    leases = {}           # "redeem"/"create" -> lease id
+    leases = {}           # unused (lease ids are looked up fresh)
+    convert_failures = 0
     conv_hold_until = -1  # while a conversion runs, positions are in flux: don't trade the ETF tickers
     now_tick = -1
 
@@ -741,36 +742,47 @@ def effective_pos(snap):
 
 
 def _lease_id(kind):
-    """Lease the converter once per heat (free, lasts the whole case); reuse a lease you already hold."""
-    if kind in ST.leases:
-        return ST.leases[kind]
+    """The id of our lease on this converter: looked up fresh each time (a stale id is what the server
+    rejected as 'Invalid lease id'); leases it first if we don't hold one."""
     ticker = CONVERTER_TICKERS[kind]
     for L in get("/leases") or []:
         if L.get("ticker") == ticker:
-            ST.leases[kind] = L["id"]
-            return L["id"]
+            return L.get("id")
     r = _req("POST", "/leases", ticker=ticker)
-    if r is not None and r.ok and "id" in r.json():
-        ST.leases[kind] = r.json()["id"]
-        return ST.leases[kind]
+    if r is not None and r.ok:
+        try:
+            return r.json().get("id")
+        except ValueError:
+            return None
     say(f"[converter] could not lease {ticker}: {r.text[:160] if r is not None else 'no response'}")
     return None
 
 
 def _use_converter(kind):
-    lid = _lease_id(kind)
-    if lid is None:
-        return False
+    """Use the converter once (10,000). Tries, in order:
+      1. POST /leases?ticker=ETF-...&from1=..&quantity1=..   (refineries can be used directly by ticker)
+      2. POST /leases/{id}?from1=..                           (classic: lease, then use the lease id)"""
+    ticker = CONVERTER_TICKERS[kind]
     if kind == "redeem":
         params = {"from1": "RITC", "quantity1": CONVERT_BLOCK, "from2": "USD", "quantity2": CONVERT_FEE_USD}
     else:
         params = {"from1": "BULL", "quantity1": CONVERT_BLOCK, "from2": "BEAR", "quantity2": CONVERT_BLOCK,
                   "from3": "USD", "quantity3": CONVERT_FEE_USD}
-    r = _req("POST", f"/leases/{lid}", **params)
-    if r is None or not r.ok:
-        say(f"[converter] use failed: {r.text[:160] if r is not None else 'no response'}")
-        return False
-    return True
+    r = _req("POST", "/leases", ticker=ticker, **params)
+    if r is not None and r.ok:
+        jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": "ticker", "resp": r.text[:300]})
+        return True
+    err1 = r.text[:160] if r is not None else "no response"
+    lid = _lease_id(kind)
+    if lid is not None:
+        r = _req("POST", f"/leases/{lid}", **params)
+        if r is not None and r.ok:
+            jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": f"lease id {lid}", "resp": r.text[:300]})
+            return True
+    err2 = r.text[:160] if r is not None else "no response"
+    say(f"[converter] {kind} failed. by ticker: {err1} | by lease id {lid}: {err2}")
+    jlog({"type": "convert_failed", "tick": ST.now_tick, "kind": kind, "err_ticker": err1, "lease_id": lid, "err_id": err2})
+    return False
 
 
 def converters(snap, tick):
@@ -799,9 +811,13 @@ def converters(snap, tick):
             event(tick, "CONVERT", f"{kind.upper()} 1 x 10,000 (#{ST.conv_prompts}, fee ${CONVERT_FEE_USD:,} USD)"
                                    f"  [{need} block{'s' if need > 1 else ''} needed]")
             return
-        ST.auto_convert = False
-        banner("CONVERTER API NOT AVAILABLE: switching to prompts.\n"
-               "Click ETF-Redemption / ETF-Creation in the RIT Client Assets tab when asked.")
+        ST.convert_failures += 1
+        if ST.convert_failures >= 3:
+            ST.auto_convert = False
+            banner("CONVERTER API FAILED 3 TIMES: switching to prompts for this heat.\n"
+                   "Click ETF-Redemption / ETF-Creation in the RIT Client Assets tab when asked.")
+        else:
+            say(f"[converter] API attempt {ST.convert_failures}/3 failed; click this one, will retry the API next time")
     banner(f">>> CONVERTER: {kind.upper()} 1 x 10,000 NOW  (Assets tab -> {CONVERTER_TICKERS[kind]})"
            f"   [{need} block{'s' if need > 1 else ''} still needed]")
     ST.conv_busy_until = tick + REPROMPT_TICKS
@@ -852,7 +868,7 @@ def main():
             ST.last_prompt_tick = -100
             ST.conv_busy_until, ST.conv_prompts, ST.inflight, ST.gap_since = -1, 0, {}, {}
             ST.ritc_plan, ST.plan_until = 0, -1
-            ST.leases, ST.conv_hold_until, ST.auto_convert = {}, -1, AUTO_CONVERT
+            ST.leases, ST.conv_hold_until, ST.auto_convert, ST.convert_failures = {}, -1, AUTO_CONVERT, 0
             ST.shadow_share, ST.shadow_obs, ST.basket_hist, ST.fill_costs = SHADOW_START, [], {}, []
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():

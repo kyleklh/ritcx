@@ -342,12 +342,15 @@ class Sim:
     def leases_view(self):
         return [{"id": i, "ticker": t} for t, (i, _) in self.LEASE_IDS.items() if t in self.leased]
 
-    def lease(self, ticker):
+    def lease(self, ticker, params=None):
+        """POST /leases?ticker=X leases it; with from1.. it also uses it straight away (refinery style)."""
         with self.lock:
             if ticker not in self.LEASE_IDS:
                 return 400, {"code": "INVALID", "message": f"Unknown asset {ticker}"}
             self.leased.add(ticker)
-            return 200, {"id": self.LEASE_IDS[ticker][0], "ticker": ticker}
+        if params and "from1" in params:
+            return self.use_lease(self.LEASE_IDS[ticker][0], params)
+        return 200, {"id": self.LEASE_IDS[ticker][0], "ticker": ticker}
 
     def use_lease(self, lid, params):
         kind = next((k for t, (i, k) in self.LEASE_IDS.items() if i == lid and t in self.leased), None)
@@ -518,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/commands/cancel":
             return self._send(*SIM.cancel(ticker=q.get("ticker")))
         if path == "/v1/leases":
-            return self._send(*SIM.lease(q.get("ticker", "")))
+            return self._send(*SIM.lease(q.get("ticker", ""), q))
         if path.startswith("/v1/leases/"):
             return self._send(*SIM.use_lease(int(path.rsplit("/", 1)[1]), q))
         if path == "/v1/mock/convert":
