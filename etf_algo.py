@@ -22,6 +22,7 @@ Live commands (type + Enter):  p / r  pause / resume tenders+arb (hedging contin
                                s      status        q  quit
 """
 import csv
+import json
 import math
 import os
 import sys
@@ -31,7 +32,7 @@ from datetime import datetime
 
 import requests
 
-from display import say, event, banner
+from display import say, event, banner, set_log_file
 
 # =========================== SETTINGS (tune between heats) ===========================
 from config import API, API_KEY   # read from .env (see .env.example); defaults to localhost:9999 / Rotman
@@ -93,7 +94,22 @@ INFLIGHT_TIMEOUT = 1.5        # seconds; after this, trade the ticker again even
 DEFAULT_GROSS, DEFAULT_NET = 300_000, 200_000   # used if /limits is unavailable
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.15))
-LOG_FILE = f"etf_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
+# Everything from a run goes to logs/ (send the whole folder after a session):
+#   etf_<time>.txt    the terminal output
+#   etf_<time>.csv    one line per tick: positions, limit usage, P&L
+#   etf_<time>.jsonl  one line per tick: all quotes, top 10 book levels with trader ids (shows how many other
+#                     teams are quoting), positions, limits; plus every market order the algo sent and its fill
+_STAMP = f"{datetime.now():%Y%m%d_%H%M%S}"
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, f"etf_{_STAMP}.csv")
+TXT_FILE = os.path.join(LOG_DIR, f"etf_{_STAMP}.txt")
+JSONL_FILE = os.path.join(LOG_DIR, f"etf_{_STAMP}.jsonl")
+_jsonl = None
+
+
+def jlog(rec):
+    if _jsonl:
+        _jsonl.write(json.dumps(rec, separators=(",", ":")) + "\n")
 # =====================================================================================
 
 s = requests.Session()
@@ -188,6 +204,8 @@ def market(ticker, action, qty, cur):
         say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120] if r is not None else 'no response'}")
         return 0
     j = r.json()
+    jlog({"type": "order", "tick": ST.now_tick, "t": round(time.time(), 3), "ticker": ticker, "action": action,
+          "qty": qty, "resp": {k: j.get(k) for k in ("order_id", "status", "quantity_filled", "vwap", "price")}})
     filled = int(j.get("quantity_filled") or 0) if j.get("status") == "TRANSACTED" else qty
     note_fill(ticker, cur, filled if action == "BUY" else -filled)
     return filled
@@ -201,11 +219,12 @@ def snapshot():
     pos = {x["ticker"]: float(x.get("position", 0)) for x in secs}
     check_inflight(pos)
     quotes = {x["ticker"]: (float(x.get("bid", 0) or 0), float(x.get("ask", 0) or 0)) for x in secs}
-    books = {}
+    books, raw_books = {}, {}
     for t in ("BULL", "BEAR", "RITC"):
         b = get("/securities/book", ticker=t, limit=40)
         if not b:
             return None
+        raw_books[t] = b
         books[t] = {"bids": [(float(l["price"]), int(l["quantity"]) - int(l.get("quantity_filled", 0)))
                              for l in b["bids"] if l.get("trader_id") != "self"],
                     "asks": [(float(l["price"]), int(l["quantity"]) - int(l.get("quantity_filled", 0)))
@@ -216,7 +235,8 @@ def snapshot():
         gl, nl = float(L.get("gross_limit") or DEFAULT_GROSS), float(L.get("net_limit") or DEFAULT_NET)
     else:
         gl, nl = DEFAULT_GROSS, DEFAULT_NET
-    return {"pos": pos, "q": quotes, "books": books, "gross_limit": gl, "net_limit": nl}
+    return {"pos": pos, "q": quotes, "books": books, "raw_books": raw_books, "gross_limit": gl, "net_limit": nl,
+            "limits_raw": lim}
 
 
 def snapshot_at(tick, ticks):
@@ -734,6 +754,11 @@ def console():
 def main():
     threading.Thread(target=console, daemon=True).start()
     banner("ETF ALGO  |  waiting for the case to start\nCommands (type + Enter): p pause | r resume | s status | q quit")
+    global _jsonl
+    os.makedirs(LOG_DIR, exist_ok=True)
+    set_log_file(TXT_FILE)
+    _jsonl = open(JSONL_FILE, "a", encoding="utf-8")
+    say(f"[logging to {LOG_DIR}/etf_{_STAMP}.*]")
     logf = open(LOG_FILE, "w", newline="")
     log = csv.writer(logf)
     log.writerow(["tick", "BULL", "BEAR", "RITC", "USD", "usage", "nlv"])
@@ -783,6 +808,16 @@ def main():
             nlv = (get("/trader") or {}).get("nlv", float("nan"))
             log.writerow([tick, p.get("BULL"), p.get("BEAR"), p.get("RITC"), round(p.get("USD", 0)), round(u, 3), nlv])
             logf.flush()
+            lvl = lambda side: [[x.get("price"), x.get("quantity", 0) - x.get("quantity_filled", 0), x.get("trader_id")]
+                                for x in side[:10]]
+            traders = sorted({x.get("trader_id") for b in snap["raw_books"].values()
+                              for x in b.get("bids", []) + b.get("asks", []) if x.get("trader_id")})
+            jlog({"type": "tick", "tick": tick, "t": round(time.time(), 3), "pos": p, "quotes": snap["q"],
+                  "books": {k: {"bids": lvl(b.get("bids", [])), "asks": lvl(b.get("asks", []))}
+                            for k, b in snap["raw_books"].items()},
+                  "traders_in_book": traders, "limits": snap["limits_raw"], "nlv": nlv,
+                  "ritc_plan": ST.ritc_plan})
+            _jsonl.flush()
             if tick % STATUS_EVERY == 0:
                 r_ = p.get("RITC", 0)
                 hedged = abs(p.get("BULL", 0) + r_) < 200 and abs(p.get("BEAR", 0) + r_) < 200

@@ -5,3 +5,4 @@ etf_log_*.csv
 *.pyc
 news_raw_*.txt
 .env
+logs/

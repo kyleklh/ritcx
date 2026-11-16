@@ -8,12 +8,22 @@ import sys
 import threading
 
 _lock = threading.Lock()
+_logf = None
+
+
+def set_log_file(path):
+    """Also append everything printed to this file (so a heat's terminal output is never lost)."""
+    global _logf
+    _logf = open(path, "a", encoding="utf-8")
 
 
 def say(msg=""):
     with _lock:
         sys.stdout.write(msg + "\n")
         sys.stdout.flush()
+        if _logf:
+            _logf.write(msg + "\n")
+            _logf.flush()
 
 
 def event(tick, tag, msg):
