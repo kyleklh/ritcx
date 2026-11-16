@@ -50,6 +50,12 @@ RITC_ROUTE_MAX = 40000        # never more than this via RITC (its book is thinn
 RITC_ROUTE_TICKS = 10         # whatever is left of that after this many ticks gets hedged with BULL+BEAR
 CROWD_SHARE = float(os.environ.get("CROWD_SHARE", "0.5"))   # share of the visible book we expect to get.
                               # 0.5 = assume other teams take half (competition). 1.0 = alone
+# Shadow mode: the algo ESTIMATES how crowded the market is from what happens after each tender, and logs
+# the decision it would have made with that estimate. It never trades on the estimate (it uses CROWD_SHARE).
+SHADOW_START = 1.0            # the estimate starts from "alone" (practice) and moves with what it sees
+SHADOW_OBS_TICKS = 5          # watch this many ticks after each tender
+SHADOW_PUSH_REF = 0.10        # CAD/share basket push that we read as "others take half the book"
+SHADOW_WEIGHT = 0.3           # how fast the estimate moves toward each new observation
 REFILL_PENALTY = 0.02         # CAD/share for hedge shares that must wait for the book to refill
 EVAL_SLICE = 20000            # walk the book for this many shares; assume patience for the rest
 EXTRA_SLIP_BEYOND_SLICE = 0.01  # extra CAD/share assumed on shares beyond the slice
@@ -125,6 +131,11 @@ class State:
     acted_tick = -1
     gap_since = {}        # leg -> tick its hedge gap opened
     last_ritc_route = 0   # shares of the tender being evaluated that would go back into RITC
+    shadow_share = SHADOW_START   # shadow estimate of CROWD_SHARE (logged only)
+    shadow_obs = []       # tenders being watched: {"t0", "sgn", "basket0", "accepted", "est_cost"}
+    basket_hist = {}      # tick -> basket mid (CAD)
+    last_quotes = {}      # latest quotes, to price our own fills against the mid
+    fill_costs = []       # (tick, ticker, shares, CAD/share cost vs mid incl. fee)
     ritc_plan = 0         # signed RITC still to trade back into the RITC book (part of a tender)
     plan_until = -1
     last_prompt_tick = -100
@@ -207,6 +218,11 @@ def market(ticker, action, qty, cur):
     jlog({"type": "order", "tick": ST.now_tick, "t": round(time.time(), 3), "ticker": ticker, "action": action,
           "qty": qty, "resp": {k: j.get(k) for k in ("order_id", "status", "quantity_filled", "vwap", "price")}})
     filled = int(j.get("quantity_filled") or 0) if j.get("status") == "TRANSACTED" else qty
+    q_ = ST.last_quotes.get(ticker)
+    if j.get("vwap") and q_ and q_[0] > 0 and ticker in ("BULL", "BEAR") and filled:
+        mid = (q_[0] + q_[1]) / 2
+        ST.fill_costs.append((ST.now_tick, ticker, filled,
+                              (float(j["vwap"]) - mid if action == "BUY" else mid - float(j["vwap"])) + FEE))
     note_fill(ticker, cur, filled if action == "BUY" else -filled)
     return filled
 
@@ -296,7 +312,7 @@ def usage(pos, gl, nl, d_ritc=0, d_bull=0, d_bear=0):
 
 
 # ------------------------------- 1. tenders -------------------------------
-def leg_value(levels, mid, q, sgn):
+def leg_value(levels, mid, q, sgn, share=None):
     """Expected CAD/share (incl. fees) to trade q shares of one leg the way hedge() does:
     - up to URGENT_GAP passively near mid (earning the rebate),
     - the rest with market orders that only take liquidity within HEDGE_SLIP of the best price. What is there
@@ -309,7 +325,8 @@ def leg_value(levels, mid, q, sgn):
         if not levels:
             return mid + sgn * (FEE + 0.10)         # empty book: assume it's expensive
         best = levels[0][0]
-        near = [(px, sz * CROWD_SHARE) for px, sz in levels if abs(px - best) <= HEDGE_SLIP + 1e-9]
+        share = CROWD_SHARE if share is None else share
+        near = [(px, sz * share) for px, sz in levels if abs(px - best) <= HEDGE_SLIP + 1e-9]
         avail = sum(sz for _, sz in near)
         take = min(qm, avail)
         got, cost = 0, 0.0
@@ -322,7 +339,7 @@ def leg_value(levels, mid, q, sgn):
         vwap = cost / got if got else best
         later = qm - take                            # waits for the book to refill
         # others hedging the same tender push the price: charge the refill wait more when crowded
-        total += qm * (vwap + sgn * FEE) + later * sgn * REFILL_PENALTY / max(CROWD_SHARE, 0.1)
+        total += qm * (vwap + sgn * FEE) + later * sgn * REFILL_PENALTY / max(share, 0.1)
     return total / q
 
 
@@ -336,7 +353,7 @@ def blocks_to_convert(pos, gl, nl, d_ritc=0):
     return math.ceil(excess / (4 * CONVERT_BLOCK))
 
 
-def evaluate_tender(t, snap):
+def evaluate_tender(t, snap, share=None):
     """Returns (edge_per_share_CAD, bid_price_for_auction_or_None, reason).
     Edge = tender price vs the basket we will sell/buy to hedge, minus converter fees for the blocks
     we must convert to fit the hedge in our limits, minus a penalty for the part that waits unhedged."""
@@ -376,17 +393,17 @@ def evaluate_tender(t, snap):
         waiting = qs - hedge_now
         extra = (n_conv * CONVERT_FEE_USD * usd) / q + UNHEDGED_PENALTY * waiting / q   # CAD per tender share
         if act == "BUY":   # we bought RITC: sell the basket for qs shares, sell x RITC back
-            stock = (leg_value(bk["BULL"]["bids"], mids["BULL"], qs, -1)
-                     + leg_value(bk["BEAR"]["bids"], mids["BEAR"], qs, -1)) if qs else 0.0
-            ritc = leg_value(bk["RITC"]["bids"], rmid, x, -1) * usd if x else 0.0
+            stock = (leg_value(bk["BULL"]["bids"], mids["BULL"], qs, -1, share)
+                     + leg_value(bk["BEAR"]["bids"], mids["BEAR"], qs, -1, share)) if qs else 0.0
+            ritc = leg_value(bk["RITC"]["bids"], rmid, x, -1, share) * usd if x else 0.0
             value = (qs * stock + x * ritc) / q                       # CAD received per tender share
             breakeven_usd = (value - extra - TENDER_MIN_EDGE) / usd
             edge = value - extra - (px * usd if px else breakeven_usd * usd + TENDER_MIN_EDGE)
             bid = math.floor(breakeven_usd * 100) / 100
         else:              # we sold RITC: buy the basket for qs shares, buy x RITC back
-            stock = (leg_value(bk["BULL"]["asks"], mids["BULL"], qs, 1)
-                     + leg_value(bk["BEAR"]["asks"], mids["BEAR"], qs, 1)) if qs else 0.0
-            ritc = leg_value(bk["RITC"]["asks"], rmid, x, 1) * usd if x else 0.0
+            stock = (leg_value(bk["BULL"]["asks"], mids["BULL"], qs, 1, share)
+                     + leg_value(bk["BEAR"]["asks"], mids["BEAR"], qs, 1, share)) if qs else 0.0
+            ritc = leg_value(bk["RITC"]["asks"], rmid, x, 1, share) * usd if x else 0.0
             value = (qs * stock + x * ritc) / q                       # CAD paid per tender share
             breakeven_usd = (value + extra + TENDER_MIN_EDGE) / usd
             edge = (px * usd if px else breakeven_usd * usd - TENDER_MIN_EDGE) - value - extra
@@ -457,6 +474,58 @@ def ritc_route(snap, tick):
         a[0] += f
 
 
+def shadow_register(t, snap, why, edge):
+    """Start watching the market after this tender (accepted or not) to estimate the crowd."""
+    q = snap["q"]
+    if not quotes_ok(q):
+        return
+    basket0 = sum(q["BULL"]) / 2 + sum(q["BEAR"]) / 2
+    ST.shadow_obs.append({"t0": int(t.get("tick", ST.now_tick)), "sgn": 1 if t["action"] == "BUY" else -1,
+                          "basket0": basket0, "accepted": why.startswith("ok") or why.startswith("auction"),
+                          "qty": t["quantity"]})
+
+
+def shadow_note(tick, t, s_edge, s_take, edge, why):
+    take = why.startswith("ok") or why.startswith("auction")
+    differs = " <- DIFFERENT" if s_take != take else ""
+    event(tick, "SHADOW", f"with crowd estimate {ST.shadow_share:.2f}: edge {s_edge:+.3f}/sh -> "
+                          f"{'accept' if s_take else 'decline'} (actual: {'accept' if take else 'decline'} "
+                          f"at {CROWD_SHARE:.2f}){differs}")
+    jlog({"type": "shadow_decision", "tick": tick, "tender_id": t.get("tender_id"), "shadow_share": ST.shadow_share,
+          "shadow_edge": s_edge, "shadow_accept": s_take, "edge": edge, "accept": take, "crowd_share": CROWD_SHARE})
+
+
+def shadow_update(tick):
+    """After SHADOW_OBS_TICKS, turn what happened into an observed crowd share and move the estimate."""
+    keep = []
+    for ob in ST.shadow_obs:
+        if tick < ob["t0"] + SHADOW_OBS_TICKS:
+            keep.append(ob)
+            continue
+        path = [ST.basket_hist[k] for k in range(ob["t0"], ob["t0"] + SHADOW_OBS_TICKS + 1) if k in ST.basket_hist]
+        if not path:
+            continue
+        # push = how far the basket moved against whoever hedges this tender (BUY tender -> hedgers sell basket)
+        push = max(-ob["sgn"] * (b - ob["basket0"]) for b in path)
+        push = max(0.0, push)
+        s_push = 1.0 / (1.0 + push / SHADOW_PUSH_REF)
+        # our own hedge cost in that window, if we traded (compare with an uncrowded ~0.03-0.05/sh)
+        fills = [(sh, c) for (tk, _, sh, c) in ST.fill_costs if ob["t0"] <= tk <= ob["t0"] + SHADOW_OBS_TICKS]
+        sh_tot = sum(sh for sh, _ in fills)
+        cost = sum(sh * c for sh, c in fills) / sh_tot if sh_tot else None
+        s_cost = min(1.0, 0.04 / cost) if cost and cost > 0 else None
+        s_obs = min(s_push, s_cost) if s_cost is not None else s_push
+        old = ST.shadow_share
+        ST.shadow_share = min(1.0, max(0.2, (1 - SHADOW_WEIGHT) * old + SHADOW_WEIGHT * s_obs))
+        event(tick, "CROWD", f"after tender @t={ob['t0']}: basket pushed {push:.3f} against hedgers"
+                             + (f", our hedge cost {cost:.3f}/sh" if cost is not None else "")
+                             + f" -> observed share {s_obs:.2f}, estimate {old:.2f} -> {ST.shadow_share:.2f}"
+                             + " (shadow only)")
+        jlog({"type": "shadow_obs", "tick": tick, "t0": ob["t0"], "accepted": ob["accepted"], "push": push,
+              "our_cost": cost, "s_push": s_push, "s_cost": s_cost, "s_obs": s_obs, "estimate": ST.shadow_share})
+    ST.shadow_obs = keep
+
+
 def handle_tenders(snap, tick):
     tenders = get("/tenders") or []
     for t in tenders:
@@ -469,10 +538,13 @@ def handle_tenders(snap, tick):
             continue
         ST.last_detail = ""
         say(f"[tender raw] {t}")
+        s_edge, _, s_why = evaluate_tender(t, snap, share=ST.shadow_share)      # shadow first (side effects)
         edge, bid, why = evaluate_tender(t, snap)
+        s_take = s_why.startswith("ok") or s_why.startswith("auction")
         working = still_hedging(snap)
         if working and (why.startswith("ok") or why.startswith("auction")):
             why = f"still hedging the last tender ({working}); edge was {edge:+.3f}/sh"
+        shadow_register(t, snap, why, edge)
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
         if why.startswith("ok"):
@@ -485,6 +557,7 @@ def handle_tenders(snap, tick):
                   + ("" if ok else "  (FAILED)"))
             if ST.last_detail:
                 event(tick, "  why", ST.last_detail)
+            shadow_note(tick, t, s_edge, s_take, edge, why)
             if ok:
                 return True
         elif why.startswith("auction"):
@@ -501,6 +574,7 @@ def handle_tenders(snap, tick):
             event(tick, "TENDER", f"decline {desc}  edge {edge:+.3f}/sh  ({why})")
         if ST.last_detail:
             event(tick, "  why", ST.last_detail)
+        shadow_note(tick, t, s_edge, s_take, edge, why)
     return False
 
 
@@ -776,6 +850,7 @@ def main():
             ST.conv_busy_until, ST.conv_prompts, ST.inflight, ST.gap_since = -1, 0, {}, {}
             ST.ritc_plan, ST.plan_until = 0, -1
             ST.leases, ST.conv_hold_until, ST.auto_convert = {}, -1, AUTO_CONVERT
+            ST.shadow_share, ST.shadow_obs, ST.basket_hist, ST.fill_costs = SHADOW_START, [], {}, []
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -791,6 +866,10 @@ def main():
             continue
         if handle_tenders(snap, tick):
             snap = snapshot_at(tick, ticks) or snap
+        ST.last_quotes = snap["q"]
+        if quotes_ok(snap["q"]) and tick not in ST.basket_hist:
+            ST.basket_hist[tick] = sum(snap["q"]["BULL"]) / 2 + sum(snap["q"]["BEAR"]) / 2
+            shadow_update(tick)
         ritc_route(snap, tick)
         converters(snap, tick)
         first_of_tick = tick != ST.acted_tick      # slow decisions (resting orders, FX) once per tick

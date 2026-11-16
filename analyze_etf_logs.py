@@ -39,7 +39,7 @@ def mean(xs):
 
 
 def load(jsonl_path):
-    ticks, orders = {}, []
+    ticks, orders, shadow = {}, [], []
     with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
             try:
@@ -50,9 +50,11 @@ def load(jsonl_path):
                 ticks[r["tick"]] = r
             elif r.get("type") == "order":
                 orders.append(r)
+            elif r.get("type") in ("shadow_obs", "shadow_decision"):
+                shadow.append(r)
     txt_path = jsonl_path[:-len(".jsonl")] + ".txt"
     tenders = parse_tenders(txt_path) if os.path.exists(txt_path) else []
-    return ticks, orders, tenders, txt_path
+    return ticks, orders, tenders, txt_path, shadow
 
 
 def parse_tenders(txt_path):
@@ -168,7 +170,7 @@ def event_study(tenders, ticks, csv_prefix):
 
 
 def analyse(path, csv_prefix=None):
-    ticks, orders, tenders, txt = load(path)
+    ticks, orders, tenders, txt, shadow = load(path)
     if not ticks:
         print(f"{path}: no tick records")
         return
@@ -270,6 +272,23 @@ def analyse(path, csv_prefix=None):
         print(f"  t={t0:3d} {td['action']:4s} {td['qty']:>7,.0f} @ {td['price']}  estimated ${est:>9,.0f}   "
               f"P&L change {'n/a' if realised is None else f'${realised:,.0f}'}"
               "   (includes everything else that happened in those ticks)")
+
+    # 6. shadow crowding estimate
+    obs = [r for r in shadow if r["type"] == "shadow_obs"]
+    decs = [r for r in shadow if r["type"] == "shadow_decision"]
+    if obs or decs:
+        section("6. Shadow crowding estimate (logged only, never traded on)")
+        for r in obs:
+            print(f"  t={r['tick']:3d} tender@{r['t0']:3d} {'(ours)' if r['accepted'] else '      '} push {r['push']:.3f}"
+                  + (f"  our cost {r['our_cost']:.3f}" if r.get("our_cost") is not None else "")
+                  + f"  -> observed {r['s_obs']:.2f}, estimate {r['estimate']:.2f}")
+        diff = [r for r in decs if r["shadow_accept"] != r["accept"]]
+        print(f"  {len(decs)} tender decisions, {len(diff)} would have been different with the estimate:")
+        for r in diff:
+            print(f"    t={r['tick']:3d} tender {r['tender_id']}: actual {'accept' if r['accept'] else 'decline'} "
+                  f"(edge {r['edge']:+.3f} at {r['crowd_share']:.2f}), shadow {'accept' if r['shadow_accept'] else 'decline'} "
+                  f"(edge {r['shadow_edge']:+.3f} at {r['shadow_share']:.2f})")
+        print("  Check section 5: did the tenders the estimate would have declined actually lose money?")
 
     # declines summary
     dec = [td for td in tenders if not td["accepted"]]
