@@ -10,6 +10,7 @@
 | `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters). |
 | `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client (talks to the fake server only). |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
+| `analyze_etf_logs.py` | Reads `logs/` after a session: competitors in the books, book depth, whether price pressure after tenders sticks or bounces, what hedges cost, tender estimate vs result. |
 
 ## Volatility case
 
