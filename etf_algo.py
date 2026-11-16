@@ -36,6 +36,9 @@ from display import say, event, banner, set_log_file
 
 # =========================== SETTINGS (tune between heats) ===========================
 from config import API, API_KEY   # read from .env (see .env.example); defaults to localhost:9999 / Rotman
+# The ETF case can run on its own RIT Client port/key: ETF_RIT_API / ETF_RIT_API_KEY in .env override the shared ones
+API = os.environ.get("ETF_RIT_API", API)
+API_KEY = os.environ.get("ETF_RIT_API_KEY", API_KEY)
 
 FEE = 0.02                    # market order fee per share
 MAX_EQ_ORDER = 10000
