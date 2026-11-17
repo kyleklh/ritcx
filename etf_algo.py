@@ -72,7 +72,9 @@ REFILL_PENALTY = 0.02         # CAD/share for hedge shares that must wait for th
 EVAL_SLICE = 20000            # walk the book for this many shares; assume patience for the rest
 EXTRA_SLIP_BEYOND_SLICE = 0.01  # extra CAD/share assumed on shares beyond the slice
 LIMIT_USAGE_MAX = 0.90        # arb keeps usage below this
-LIMIT_TRANSIENT_MAX = 0.97    # max usage right after accepting a tender, before any hedge trades
+LIMIT_TRANSIENT_MAX = 1.00    # max usage right after accepting a tender, before any hedge trades. Was 0.97: a
+                              # 98k tender alone is 196k of the 200k NET limit (RITC counts 2x), so every tender
+                              # above ~97k was refused even when flat (practice Nov 16 t=116: a +$57k tender lost)
 HEDGE_USAGE_MAX = 0.96        # hedge orders never push gross usage above this (converters free the rest)
 
 # Hedging: passive first (limit orders earn the rebate), market orders only for risk above URGENT_GAP
@@ -85,7 +87,7 @@ HEDGE_SLIP = 0.03             # market hedges only take liquidity within this di
 FAST_TICKS = int(os.environ.get("FAST_TICKS", "12"))
 FAST_SLIP = float(os.environ.get("FAST_SLIP", "0.03"))
 HEDGE_MIN = 100               # ignore smaller imbalances
-REBATE = 0.01
+REBATE = 0.03                 # limit order rebate per share (case info sheet)
 
 # Arbitrage
 ARB_OPEN_EDGE = 0.03          # CAD/share net of 3 fees, to OPEN / grow pairs
@@ -179,6 +181,7 @@ class State:
     now_tick = -1
     fast_until = -1       # tick until which the hedge runs in fast mode (just took a tender)
     route_tick = -1
+    leased = False
     last_tender_tick = -100
 
 
@@ -822,29 +825,40 @@ def _lease_id(kind):
 
 def _use_converter(kind):
     """Use the converter once (10,000). Tries, in order:
-      1. POST /leases?ticker=ETF-...&from1=..&quantity1=..   (refineries can be used directly by ticker)
-      2. POST /leases/{id}?from1=..                           (classic: lease, then use the lease id)"""
+      1. POST /leases/{id}?from1=..                           (lease, then use the lease id: works on the real server)
+      2. POST /leases?ticker=ETF-...&from1=..&quantity1=..   (by ticker: refused for REFINERY assets, kept as a fallback)"""
     ticker = CONVERTER_TICKERS[kind]
     if kind == "redeem":
         params = {"from1": "RITC", "quantity1": CONVERT_BLOCK, "from2": "USD", "quantity2": CONVERT_FEE_USD}
     else:
         params = {"from1": "BULL", "quantity1": CONVERT_BLOCK, "from2": "BEAR", "quantity2": CONVERT_BLOCK,
                   "from3": "USD", "quantity3": CONVERT_FEE_USD}
-    r = _req("POST", "/leases", ticker=ticker, **params)
-    if r is not None and r.ok:
-        jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": "ticker", "resp": r.text[:300]})
-        return True
-    err1 = r.text[:160] if r is not None else "no response"
     lid = _lease_id(kind)
+    err2 = "no lease"
     if lid is not None:
         r = _req("POST", f"/leases/{lid}", **params)
         if r is not None and r.ok:
             jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": f"lease id {lid}", "resp": r.text[:300]})
             return True
-    err2 = r.text[:160] if r is not None else "no response"
-    say(f"[converter] {kind} failed. by ticker: {err1} | by lease id {lid}: {err2}")
+        err2 = r.text[:160] if r is not None else "no response"
+    r = _req("POST", "/leases", ticker=ticker, **params)       # never worked on the real server; last resort
+    if r is not None and r.ok:
+        jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": "ticker", "resp": r.text[:300]})
+        return True
+    err1 = r.text[:160] if r is not None else "no response"
+    say(f"[converter] {kind} failed. by lease id {lid}: {err2} | by ticker: {err1}")
     jlog({"type": "convert_failed", "tick": ST.now_tick, "kind": kind, "err_ticker": err1, "lease_id": lid, "err_id": err2})
     return False
+
+
+def lease_converters(tick):
+    """Lease both converters early in the heat: a lease made in the same tick as its first use was refused
+    ('Invalid lease id 1' at t=144 in practice, fine from t=148 on). Leases are free, one per trader each."""
+    if not AUTO_CONVERT or ST.leased or tick < 1:
+        return
+    ids = {k: _lease_id(k) for k in CONVERTER_TICKERS}
+    ST.leased = all(v is not None for v in ids.values())
+    say(f"[converter] leases: {ids}")
 
 
 def converters(snap, tick):
@@ -940,6 +954,7 @@ def main():
             ST.leases, ST.conv_hold_until, ST.auto_convert, ST.convert_failures = {}, -1, AUTO_CONVERT, 0
             ST.shadow_share, ST.shadow_obs, ST.basket_hist, ST.fill_costs = SHADOW_START, [], {}, []
             ST.fast_until, ST.last_tender_tick = -1, -100
+            ST.leased = False
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -961,6 +976,7 @@ def main():
             ST.basket_hist[tick] = sum(snap["q"]["BULL"]) / 2 + sum(snap["q"]["BEAR"]) / 2
             shadow_update(tick)
         ritc_route(snap, tick)
+        lease_converters(tick)
         converters(snap, tick)
         first_of_tick = tick != ST.acted_tick      # slow decisions (resting orders, FX) once per tick
         ST.acted_tick = tick
