@@ -214,8 +214,16 @@ def vol_for_week(w):
     return None
 
 
+VOL_HORIZON = os.environ.get("VOL_HORIZON", "life")   # "life": average variance over the options' remaining
+                              # life (trades the mid-week forecast at once). "current": this week's vol only, so the
+                              # book moves to next week's vol at the week start (t=76/151/226), when the market maker
+                              # resets its vol (often the wrong way, then drifts back to the true vol).
+
+
 def fair_vol(tick):
-    """sqrt of time-weighted variance over the options' remaining life."""
+    """sqrt of time-weighted variance over the options' remaining life (or this week's vol, see VOL_HORIZON)."""
+    if VOL_HORIZON == "current":
+        return vol_for_week(week_of(max(1, tick)))
     var, tot = 0.0, 0
     for w in range(1, 5):
         start, end = (w - 1) * ST.week_len, w * ST.week_len
