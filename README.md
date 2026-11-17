@@ -129,8 +129,8 @@ Batch test, 6 heats at 5x speed:
    - For `FAST_TICKS` after taking a tender (and in the last `FLATTEN_TICKS`): the whole gap at market, once
      per tick, everything within `FAST_SLIP` (0.03) of that tick's best price, 10k clips alternating BULL/BEAR,
      no resting orders. Replaying the Nov 16 real books: this cost ~0.18/sh; walking to 0.15 at once cost ~0.26.
-   - Tenders are valued with that measured cost (`TENDER_HEDGE_COST`, 0.18 CAD/sh incl. fees) instead of a book
-     walk: accept when tender vs basket mid beats it by `TENDER_MIN_EDGE` (so roughly 0.25+ over the basket).
+   - Tenders are valued with that measured cost (`TENDER_HEDGE_COST`, 0.15 CAD/sh incl. fees; measured 0.13-0.18) instead of a book
+     walk: accept when tender vs basket mid beats it by `TENDER_MIN_EDGE` (so roughly 0.20-0.25+ over the basket).
    - Otherwise: limit orders at the best price first (earning the $0.01 rebate), market orders only for the
      part of the gap beyond `URGENT_GAP`.
    - A resting order on a leg is cancelled before market-trading it (a late-filling resting bid overshot the

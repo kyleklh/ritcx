@@ -53,7 +53,9 @@ TENDER_MIN_EDGE = float(os.environ.get("TENDER_MIN_EDGE", "0.05"))        # CAD/
 # tender arrives. Measured by replaying all 32 tenders of the Nov 16 real heats against the logged books (take
 # everything within 0.03 of best each tick): mean 0.18, range 0.09-0.33. Walking the visible book underestimated
 # it (0.09-0.19); with this number, tenders 0.25+ over the basket were the profitable ones (~$98k over 4 heats).
-TENDER_HEDGE_COST = float(os.environ.get("TENDER_HEDGE_COST", "0.18"))
+# Across all 48 logged tenders (Nov 16 heats + 2 solo practices): 0.18 took 8 (all winners, +$153k), 0.15 took
+# 11 (all winners, +$177k), 0.13 took 12 (+$180k), 0.10 took 13 incl. a loser. 0.15 keeps a margin over 0.13.
+TENDER_HEDGE_COST = float(os.environ.get("TENDER_HEDGE_COST", "0.15"))
 TENDER_MIN_PROFIT = 500       # CAD total; skip tiny wins
 UNHEDGED_PENALTY = 0.03       # CAD/share charged on the part we cannot hedge right away (waits for converters)
 RITC_ROUTE_SPLITS = (0.0,)     # fractions of a tender we may trade straight back into the RITC book (off: on the
