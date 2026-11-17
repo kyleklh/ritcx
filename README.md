@@ -125,12 +125,26 @@ Batch test, 6 heats at 5x speed:
      (`UNHEDGED_PENALTY`) in the tender's edge. It accepts if the edge is at least `TENDER_MIN_EDGE` per share.
    - Auction tenders get a bid priced to keep that edge.
 2. **Hedge**: keeps BULL = BEAR = -RITC, never pushing gross above `HEDGE_USAGE_MAX`.
-   - Limit orders at the best price first (earning the $0.01 rebate).
-   - Market orders only for the part of the gap beyond `URGENT_GAP`.
+   - For `FAST_TICKS` after taking a tender (and in the last `FLATTEN_TICKS`): the whole gap at market right
+     away, several 10k clips per loop alternating BULL/BEAR, up to `FAST_SLIP` from the best price, no resting
+     orders. Every team hedges the same tender, so the basket runs 0.15-0.25 away within ~5 ticks; being first
+     is what matters. (Real heats on Nov 16: the slow hedge gave back most of ~$80k of raw tender edge.)
+   - Otherwise: limit orders at the best price first (earning the $0.01 rebate), market orders only for the
+     part of the gap beyond `URGENT_GAP`.
+   - A resting order on a leg is cancelled before market-trading it (a late-filling resting bid overshot the
+     hedge by ~10k in the real heats).
 3. **Arb**: trades RITC when RITC vs the basket is mispriced beyond fees; the hedge adds the basket legs.
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
+9. **Limit room**: pairs left from a tender are unwound at up to `ROOM_UNWIND_EDGE` down to `ROOM_TARGET`; if
+   they're still above `ROOM_CONVERT_ABOVE` `ROOM_CONVERT_AFTER` ticks after the tender, hedged 10k blocks are
+   converted so the next tender fits (Nov 16: ~$44k of tenders declined on limits).
+10. **End of heat**: no new arb pairs in the last `NO_OPEN_TICKS`, no tenders in the last `TENDER_CUTOFF_TICKS`,
+   every pair unwound at up to `FLATTEN_EDGE` in the last `FLATTEN_TICKS`, nothing but hedging in the last
+   `QUIET_TICKS`. The close-out marks RITC at its own last price, which sits +-0.2-0.4 off the basket.
+11. **P&L swings**: the status line shows `fair`, the P&L with RITC marked at the basket's value. RIT's P&L
+   swings by thousands on hedged pairs as RITC wobbles around the basket; `fair` is the number to watch.
 7. **Two exit routes for tenders**: part of a tender (up to `RITC_ROUTE_MAX`) can go straight back into the RITC
    book (1 trade, 1 fee, no converters) instead of being hedged with BULL+BEAR. The tender valuation tries a few
    splits and keeps the best; whatever the RITC route hasn't done after `RITC_ROUTE_TICKS` is hedged with stocks.
