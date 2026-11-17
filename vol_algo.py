@@ -45,7 +45,8 @@ REVERSE_EDGE = float(os.environ.get("REVERSE_EDGE", 0.10))          # edge neede
                               # The "direction" is remembered until the book has been flat for a while, so
                               # closing shorts and then opening longs at a small edge still counts as a flip.
 CLIP = 100                    # contracts per order (max 100)
-FAST_ENTRY = os.environ.get("FAST_ENTRY", "1") != "0"
+FAST_ENTRY = os.environ.get("FAST_ENTRY", "0") == "1"   # mock with week-start jumps, 12 seeds vs 4 orders: 2 orders
+                              # -$16k, 3 and 10 no change, 20 with no pause +$1.2k +- 1.7k but fines doubled. Off.
 MAX_ORDERS_PER_LOOP = int(os.environ.get("MAX_ORDERS", 20 if FAST_ENTRY else 4))   # option orders per loop. The market maker's vol jumps at the week
                               # start (t=76/151/226) and the extreme lasts 1-2 ticks; at 4 orders (400 contracts) per
                               # loop a -950 -> +950 flip took ~8 ticks live (heat 2, 16 Nov). RIT allows 50 orders/s.
