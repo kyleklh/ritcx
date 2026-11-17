@@ -46,7 +46,8 @@ class TradeOptionsTest(unittest.TestCase):
         # short book adding more shorts at MIN_EDGE is not a reversal
         info = make_info({"RTM48P": {"pos": -400}, "RTM49C": {"pos": -50, "sell_edge": 0.03}})
         va.trade_options(info, 117, gcap=1e9)
-        self.assertEqual(self.sold("RTM49C"), 400)   # 4 orders x 100
+        net_room = va.MAX_NET_CONTRACTS - 450          # book is short 450 already
+        self.assertEqual(self.sold("RTM49C"), min(100 * va.MAX_ORDERS_PER_LOOP, net_room))
 
 
 class EmptyQuoteTest(unittest.TestCase):

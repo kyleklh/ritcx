@@ -45,7 +45,10 @@ REVERSE_EDGE = float(os.environ.get("REVERSE_EDGE", 0.10))          # edge neede
                               # The "direction" is remembered until the book has been flat for a while, so
                               # closing shorts and then opening longs at a small edge still counts as a flip.
 CLIP = 100                    # contracts per order (max 100)
-MAX_ORDERS_PER_LOOP = 4       # how many option orders to fire per loop (fast entry after news)
+FAST_ENTRY = os.environ.get("FAST_ENTRY", "1") != "0"
+MAX_ORDERS_PER_LOOP = 20 if FAST_ENTRY else 4   # option orders per loop. The market maker's vol jumps at the week
+                              # start (t=76/151/226) and the extreme lasts 1-2 ticks; at 4 orders (400 contracts) per
+                              # loop a -950 -> +950 flip took ~8 ticks live (heat 2, 16 Nov). RIT allows 50 orders/s.
 MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
 MAX_GROSS_CONTRACTS = 2400    # case limit 2500 gross
 
@@ -618,7 +621,8 @@ def main():
         if took > 1.0 and tick - ST.last_slow_warn >= 10:
             ST.last_slow_warn = tick
             event(tick, "SLOW !!", f"one loop took {took:.1f}s (should be <0.5s). API is slow: check the connection")
-        time.sleep(LOOP_SLEEP)
+        if not (FAST_ENTRY and traded):          # after a trading loop, look again at once: edge may remain
+            time.sleep(LOOP_SLEEP)
     logf.close()
     say("Stopped.")
 

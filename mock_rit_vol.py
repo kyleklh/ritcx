@@ -45,7 +45,7 @@ def parse_option(t):
 
 
 class Sim:
-    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0):
+    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0, reset_sd=0.0):
         self.rng = random.Random(seed)
         self.tick_seconds = tick_seconds
         self.ticks = ticks
@@ -58,6 +58,8 @@ class Sim:
         alt = random.Random(None if seed is None else seed + 1_000_000)
         self.alt = alt
         self.range_miss = range_miss
+        self.reset_sd = reset_sd        # real server (16 Nov logs): at each week start the MM's vol JUMPS to
+                                        # roughly true vol +- 15 pts (often the wrong way), then drifts back
         if mm_start is None:
             mm_start = 0.25
         elif mm_start < 0:                      # random starting guess for the market maker
@@ -124,6 +126,8 @@ class Sim:
             # market maker learns the true vol with a lag
             k = 1 - 0.5 ** (1 / self.half_life)
             self.mm_vol += (sigma - self.mm_vol) * k
+            if self.reset_sd and w > 1 and self.tick == (w - 1) * self.week_len + 1:
+                self.mm_vol = max(0.05, sigma + self.alt.gauss(0, self.reset_sd))
             # news
             # News wording and timing copied from the real RITCx practice server (Nov 2026):
             #   t=1   ticker "Week 1", headline "Risk free rate and current annualized volatility of RTM"
@@ -291,7 +295,8 @@ def run_clock(args):
     global SIM
     seed = args.seed
     while True:
-        SIM = Sim(args.tick, seed, half_life=args.half_life, mm_start=args.mm_start, range_miss=args.range_miss)
+        SIM = Sim(args.tick, seed, half_life=args.half_life, mm_start=args.mm_start, range_miss=args.range_miss,
+                  reset_sd=args.reset_sd)
         print(f"[mock] new heat, seed={seed}. (true vols hidden; printed at the end)", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -311,6 +316,8 @@ def main():
     p.add_argument("--half-life", type=float, default=20.0, help="ticks for market maker to close half the vol gap")
     p.add_argument("--mm-start", type=float, default=None, help="market maker's starting vol (-1 = random 15-40%%)")
     p.add_argument("--range-miss", type=float, default=0.0, help="probability a forecast range misses the true vol")
+    p.add_argument("--reset-sd", type=float, default=0.0,
+                   help="MM vol jumps to true vol + N(0, this) at each week start, like the real server (try 0.15)")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true", help="start a new heat after each one ends")
     args = p.parse_args()
