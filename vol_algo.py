@@ -46,7 +46,7 @@ REVERSE_EDGE = float(os.environ.get("REVERSE_EDGE", 0.10))          # edge neede
                               # closing shorts and then opening longs at a small edge still counts as a flip.
 CLIP = 100                    # contracts per order (max 100)
 FAST_ENTRY = os.environ.get("FAST_ENTRY", "1") != "0"
-MAX_ORDERS_PER_LOOP = 20 if FAST_ENTRY else 4   # option orders per loop. The market maker's vol jumps at the week
+MAX_ORDERS_PER_LOOP = int(os.environ.get("MAX_ORDERS", 20 if FAST_ENTRY else 4))   # option orders per loop. The market maker's vol jumps at the week
                               # start (t=76/151/226) and the extreme lasts 1-2 ticks; at 4 orders (400 contracts) per
                               # loop a -950 -> +950 flip took ~8 ticks live (heat 2, 16 Nov). RIT allows 50 orders/s.
 MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
@@ -74,7 +74,8 @@ GAMMA_ADD_UP_TO = 0.90        # ...and add new risk only up to 90% of it (the ga
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.2))             # seconds between loops
-LOG_FILE = f"vol_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
+LOG_ROOT = os.environ.get("VOL_LOG_DIR", os.path.join("logs", "vol"))   # one folder per heat inside this:
+                              # vol_log.csv (per tick), news_raw.txt (every news item), console.txt (terminal output)
 # =====================================================================================
 
 CALLS = {k: f"RTM{k}C" for k in STRIKES}
@@ -105,6 +106,7 @@ class State:
         self.fill_acc = {}        # (side, ticker) -> contracts, printed once per tick
         self.book_dir = 0         # +1 long / -1 short: the direction the book last had, kept while flat
         self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
+        self.news_file = os.devnull
 
 
 ST = State()
@@ -153,7 +155,6 @@ RE_RANGE = re.compile(NUM + r"\s*%?\s*(?:-|–|~|to|and)\s*" + NUM + r"\s*%", re
 RE_POINT = re.compile(r"(?:will be|is|of|at)\s*" + NUM + r"\s*%", re.I)
 RE_WEEK = re.compile(r"week\s*(\d)", re.I)
 RE_VOL_POINT = re.compile(r"volatil\w*(?:[^%\d]{0,60}?)(?:will be|is|of|at)\s*" + NUM + r"\s*%", re.I)
-NEWS_RAW_FILE = f"news_raw_{datetime.now():%Y%m%d_%H%M%S}.txt"   # every news item verbatim, for checking the parser
 
 
 def week_of(tick):
@@ -172,7 +173,7 @@ def parse_news():
         ticker = str(n.get("ticker", "") or "")
         text = f"{n.get('headline', '')} {n.get('body', '')}"
         try:
-            with open(NEWS_RAW_FILE, "a") as f:
+            with open(ST.news_file, "a", encoding="utf-8") as f:
                 f.write(f"tick={tick} ticker={ticker!r} headline={n.get('headline', '')!r} body={n.get('body', '')!r}\n")
         except OSError:
             pass
@@ -499,6 +500,28 @@ def hedge(sec, info, tick, force=False):
     return d
 
 
+def open_heat_logs(old=None):
+    """Start a fresh folder for this heat: logs/vol/<date_time>/ with vol_log.csv, news_raw.txt, console.txt."""
+    if old:
+        old.close()
+    folder = os.path.join(LOG_ROOT, f"{datetime.now():%Y%m%d_%H%M%S}")
+    n = 1
+    while os.path.exists(folder):
+        n += 1
+        folder = os.path.join(LOG_ROOT, f"{datetime.now():%Y%m%d_%H%M%S}_{n}")
+    os.makedirs(folder)
+    ST.news_file = os.path.join(folder, "news_raw.txt")
+    import display
+    if display._logf:
+        display._logf.close()
+    display.set_log_file(os.path.join(folder, "console.txt"))
+    logf = open(os.path.join(folder, "vol_log.csv"), "w", newline="")
+    log = csv.writer(logf)
+    log.writerow(["tick", "S", "fair_vol", "atm_iv", "net_contracts", "delta", "nlv"])
+    say(f"[log] this heat is saved in {folder}")
+    return logf, log
+
+
 def flush_tick(tick):
     """Print this tick's trades and hedges as one line each."""
     for (side, tk), (qty, edge) in sorted(ST.fill_acc.items()):
@@ -546,9 +569,7 @@ def console():
 def main():
     threading.Thread(target=console, daemon=True).start()
     banner("VOL ALGO  |  waiting for the case to start\nCommands (type + Enter): v 25 | n 27 30 | p pause | r resume | h hedge | s status | q quit")
-    logf = open(LOG_FILE, "w", newline="")
-    log = csv.writer(logf)
-    log.writerow(["tick", "S", "fair_vol", "atm_iv", "net_contracts", "delta", "nlv"])
+    logf = log = None                                   # opened when a heat is actually running
     last_print = -1
     while not ST.quit:
         case = api_get("/case")
@@ -559,6 +580,9 @@ def main():
         if tick < ST.last_tick:                       # new heat started: reset memory
             banner("NEW HEAT")
             ST.reset()
+            logf, log = open_heat_logs(logf)
+        if logf is None:
+            logf, log = open_heat_logs()
         if ST.last_tick == -1 and tick > 5:
             event(tick, "NOTE", f"joined mid-heat at tick {tick}; reading past news first")
         if tick != ST.flush_tick:
@@ -623,7 +647,8 @@ def main():
             event(tick, "SLOW !!", f"one loop took {took:.1f}s (should be <0.5s). API is slow: check the connection")
         if not (FAST_ENTRY and traded):          # after a trading loop, look again at once: edge may remain
             time.sleep(LOOP_SLEEP)
-    logf.close()
+    if logf:
+        logf.close()
     say("Stopped.")
 
 

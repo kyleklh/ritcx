@@ -75,16 +75,18 @@ Live commands (type + Enter):
 
 ### Is a change better? Replay your real heats
 
-Every heat leaves a `vol_log_*.csv` (and `news_raw_*.txt`) in the folder you ran from. Keep them: the
-market maker prices all options at one vol, so RTM's price and that vol per tick rebuild every quote,
-and two versions of the algo can be compared on the exact market you traded.
+Every heat is saved in its own folder, `logs/vol/<date_time>/`, with three files:
+`vol_log.csv` (one row per tick), `news_raw.txt` (every news item) and `console.txt` (the terminal output).
+The market maker prices all options at one vol, so RTM's price and that vol per tick rebuild every quote,
+and two versions of the algo can be compared on the exact market you traded:
 
-    mkdir -p logs/heatA          # one folder per heat: its vol_log_*.csv (+ news_raw_*.txt if you have it)
-    python replay_compare.py logs/heatA logs/heatB --refs main WORKTREE --repeats 4
+    python replay_compare.py logs/vol/20261117_171049 logs/vol/20261117_172511 --refs main WORKTREE --repeats 4
 
-`--refs` are git refs (or `WORKTREE` for the files on disk). Look at the per-heat difference, not totals:
-one heat's P&L swings about +-$5k on tiny quote changes, so judge on several heats. A log holding several
-heats (tick drops back to 1) must be split first. Without a news file the news is inferred from `fair_vol`.
+`--refs` are git refs, `WORKTREE` (the files on disk) or a folder holding a vol_algo.py. Look at the per-heat
+difference, not totals: one heat's P&L swings about +-$5k on tiny quote changes, so judge on several heats.
+Old flat files (`vol_log_X.csv` + `news_raw_X.txt`, several heats each) can be sorted into the same layout:
+
+    python organize_logs.py path\to\old_files
 
 ### Check once you have practice-server access
 

@@ -1,11 +1,11 @@
 """
 Compare versions of vol_algo.py on REAL heats you logged (see replay_rit_vol.py).
 
-Put each heat's two files in one folder, e.g.
-    logs/run5/vol_log_20261114_2010.csv
-    logs/run5/news_raw_20261114_2010.txt     (or console.txt: a saved console log)
+vol_algo saves each heat in its own folder (logs/vol/<date_time>/), which is exactly what this takes:
 
-    python replay_compare.py logs/run5 logs/run6 --refs main HEAD --repeats 2
+    python replay_compare.py logs/vol/20261117_171049 logs/vol/20261117_172511 --refs main WORKTREE --repeats 4
+
+Older flat files (vol_log_X.csv + news_raw_X.txt) can be sorted into that layout with organize_logs.py.
 
 --refs are git refs (branch, tag, commit) or WORKTREE for the files on disk now. Each version is run
 --repeats times per heat with a small vol jitter (see replay_rit_vol.py): the algo is path-sensitive, so
@@ -27,10 +27,13 @@ LIVE = re.compile(r"live P&L at t=(\d+): ([-\d,\.]+|nan)")
 
 
 def heat_files(folder):
-    csvs = sorted(glob.glob(os.path.join(folder, "vol_log_*.csv")))
-    news = sorted(glob.glob(os.path.join(folder, "news_raw_*.txt"))) or sorted(glob.glob(os.path.join(folder, "*.txt")))
+    """A heat folder as vol_algo writes it (logs/vol/<date_time>/: vol_log.csv + news_raw.txt + console.txt),
+    or older files (vol_log_X.csv + news_raw_X.txt or a saved console log)."""
+    csvs = sorted(glob.glob(os.path.join(folder, "vol_log*.csv")))
+    news = (sorted(glob.glob(os.path.join(folder, "news_raw*.txt"))) or
+            sorted(glob.glob(os.path.join(folder, "console*.txt"))) or sorted(glob.glob(os.path.join(folder, "*.txt"))))
     if len(csvs) != 1:
-        sys.exit(f"{folder}: need exactly one vol_log_*.csv (plus optionally a news_raw_*.txt or console .txt)")
+        sys.exit(f"{folder}: need exactly one vol_log csv (plus optionally news_raw / console .txt)")
     return csvs[0], (news[0] if news else None)      # no news file: replay infers it from fair_vol
 
 
@@ -56,7 +59,7 @@ def run_batch(jobs, tick, loop_sleep):
     algos = []
     for label, heat, code, port, srv in procs:
         wd = tempfile.mkdtemp(prefix="replay_")
-        env = dict(os.environ, RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
+        env = dict(os.environ, VOL_LOG_DIR=os.path.join(wd, "logs"), RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
         algos.append(subprocess.Popen([sys.executable, os.path.join(code, "vol_algo.py")], cwd=wd, env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     out = []
