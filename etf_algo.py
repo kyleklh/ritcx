@@ -101,6 +101,9 @@ ARB_MAX_PAIRS = 10000         # max |RITC| the arb module builds on its own (kee
 ROOM_TARGET = 10000           # after a tender, unwind pairs above this |RITC| to make room for the next one...
 ROOM_UNWIND_EDGE = -0.05      # ...even at a small loss: up to this CAD/share past fees (converting costs ~0.15)
 ROOM_CONVERT_AFTER = 10       # if the market hasn't shrunk them this many ticks after a tender...
+ROOM_CONVERT_MIN_LEFT = 60    # ...but only while another tender can still come and be taken (they arrive every
+                              # ~25-35 ticks; none are taken in the last TENDER_CUTOFF_TICKS). Practice: after a t=239
+                              # tender, 4-5 room conversions (~$7k of fees) freed room no tender could use.
 ROOM_CONVERT_ABOVE = 30000    # ...convert hedged 10k blocks while |RITC| is above this (frees room for the next tender;
                               # real heats: 4 tenders worth ~$44k declined on limits while we sat on old pairs)
 # End of heat: the close-out marks RITC at its last price, which sits +-0.2-0.4 CAD off the basket, so pairs held
@@ -877,7 +880,7 @@ def converters(snap, tick):
     need = blocks_to_convert(pos, gl, nl, d_ritc=ST.ritc_plan)
     r = pos.get("RITC", 0) + ST.ritc_plan
     if (tick - ST.last_tender_tick >= ROOM_CONVERT_AFTER and tick > ST.fast_until
-            and ticks_total - tick > NO_OPEN_TICKS):
+            and ticks_total - tick > ROOM_CONVERT_MIN_LEFT):
         # the market didn't shrink the tender's pairs: convert down toward ROOM_CONVERT_ABOVE so the next one fits
         need = max(need, math.ceil(max(0.0, abs(r) - ROOM_CONVERT_ABOVE) / CONVERT_BLOCK))
     if need == 0:
