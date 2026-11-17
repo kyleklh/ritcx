@@ -10,6 +10,7 @@
 | `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters). |
 | `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client (talks to the fake server only). |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
+| `replay_etf_tenders.py` | Replays every tender of a real session against its logged books: raw edge, what hedging really cost, and what the current algo would decide. Settings it calibrates (`TENDER_HEDGE_COST`, `TENDER_MIN_EDGE`, `FAST_SLIP`) can be set in `.env`. |
 | `analyze_etf_logs.py` | Reads `logs/` after a session: competitors in the books, book depth, whether price pressure after tenders sticks or bounces, what hedges cost, tender estimate vs result. |
 
 ## Volatility case
@@ -125,10 +126,11 @@ Batch test, 6 heats at 5x speed:
      (`UNHEDGED_PENALTY`) in the tender's edge. It accepts if the edge is at least `TENDER_MIN_EDGE` per share.
    - Auction tenders get a bid priced to keep that edge.
 2. **Hedge**: keeps BULL = BEAR = -RITC, never pushing gross above `HEDGE_USAGE_MAX`.
-   - For `FAST_TICKS` after taking a tender (and in the last `FLATTEN_TICKS`): the whole gap at market right
-     away, several 10k clips per loop alternating BULL/BEAR, up to `FAST_SLIP` from the best price, no resting
-     orders. Every team hedges the same tender, so the basket runs 0.15-0.25 away within ~5 ticks; being first
-     is what matters. (Real heats on Nov 16: the slow hedge gave back most of ~$80k of raw tender edge.)
+   - For `FAST_TICKS` after taking a tender (and in the last `FLATTEN_TICKS`): the whole gap at market, once
+     per tick, everything within `FAST_SLIP` (0.03) of that tick's best price, 10k clips alternating BULL/BEAR,
+     no resting orders. Replaying the Nov 16 real books: this cost ~0.18/sh; walking to 0.15 at once cost ~0.26.
+   - Tenders are valued with that measured cost (`TENDER_HEDGE_COST`, 0.18 CAD/sh incl. fees) instead of a book
+     walk: accept when tender vs basket mid beats it by `TENDER_MIN_EDGE` (so roughly 0.25+ over the basket).
    - Otherwise: limit orders at the best price first (earning the $0.01 rebate), market orders only for the
      part of the gap beyond `URGENT_GAP`.
    - A resting order on a leg is cancelled before market-trading it (a late-filling resting bid overshot the

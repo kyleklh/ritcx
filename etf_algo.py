@@ -48,10 +48,16 @@ MAX_EQ_ORDER = 10000
 MAX_FX_ORDER = 2_500_000
 
 # Tenders
-TENDER_MIN_EDGE = 0.04        # CAD/share profit required after hedge cost + fees
+TENDER_MIN_EDGE = float(os.environ.get("TENDER_MIN_EDGE", "0.05"))        # CAD/share profit required after hedge cost + fees
+# What hedging a tender with BULL+BEAR really costs, CAD per share incl. both fees, vs the basket mid when the
+# tender arrives. Measured by replaying all 32 tenders of the Nov 16 real heats against the logged books (take
+# everything within 0.03 of best each tick): mean 0.18, range 0.09-0.33. Walking the visible book underestimated
+# it (0.09-0.19); with this number, tenders 0.25+ over the basket were the profitable ones (~$98k over 4 heats).
+TENDER_HEDGE_COST = float(os.environ.get("TENDER_HEDGE_COST", "0.18"))
 TENDER_MIN_PROFIT = 500       # CAD total; skip tiny wins
 UNHEDGED_PENALTY = 0.03       # CAD/share charged on the part we cannot hedge right away (waits for converters)
-RITC_ROUTE_SPLITS = (0.0, 0.25, 0.5)   # fractions of a tender we may trade straight back into the RITC book
+RITC_ROUTE_SPLITS = (0.0,)     # fractions of a tender we may trade straight back into the RITC book (off: on the
+                              # real books it cost up to 0.30/sh, and TENDER_HEDGE_COST is measured without it)
 RITC_ROUTE_MAX = 40000        # never more than this via RITC (its book is thinner)
 RITC_ROUTE_TICKS = 10         # whatever is left of that after this many ticks gets hedged with BULL+BEAR
 CROWD_SHARE = float(os.environ.get("CROWD_SHARE", "0.5"))   # share of the visible book we expect to get.
@@ -73,11 +79,11 @@ HEDGE_USAGE_MAX = 0.96        # hedge orders never push gross usage above this (
 URGENT_GAP = 5000             # max unhedged shares per leg we tolerate; anything beyond is hedged at market
 STALL_TICKS = 5               # if a leg's gap hasn't closed passively after this many ticks, close it at market
 HEDGE_SLIP = 0.03             # market hedges only take liquidity within this distance of the best price
-# Right after a tender every team hedges the same way, so the basket runs away within a few ticks (real heats:
-# 0.15-0.25 CAD in ~5 ticks). For FAST_TICKS after we take a tender, hedge ALL of it at once: no passive part,
-# several 10k clips per loop, taking liquidity up to FAST_SLIP from the best price.
-FAST_TICKS = 8
-FAST_SLIP = 0.15
+# For FAST_TICKS after we take a tender, hedge ALL of it at market, no passive part: once per tick, everything
+# within FAST_SLIP of that tick's best price, in 10k clips alternating BULL/BEAR. Replaying the real books, this
+# patient version cost ~0.18/sh; walking to 0.15 at once cost ~0.26 (book levels are 0.03-0.08 apart, ~10k each).
+FAST_TICKS = int(os.environ.get("FAST_TICKS", "12"))
+FAST_SLIP = float(os.environ.get("FAST_SLIP", "0.03"))
 HEDGE_MIN = 100               # ignore smaller imbalances
 REBATE = 0.01
 
@@ -172,6 +178,7 @@ class State:
     conv_hold_until = -1  # while a conversion runs, positions are in flux: don't trade the ETF tickers
     now_tick = -1
     fast_until = -1       # tick until which the hedge runs in fast mode (just took a tender)
+    route_tick = -1
     last_tender_tick = -100
 
 
@@ -337,25 +344,11 @@ def usage(pos, gl, nl, d_ritc=0, d_bull=0, d_bear=0):
 
 # ------------------------------- 1. tenders -------------------------------
 def leg_value(levels, mid, q, sgn, share=None):
-    """Expected CAD/share (incl. fees) to trade q shares of one leg the way the fast hedge does: market orders
-    right away, taking our share of the visible liquidity within FAST_SLIP of the best price. Whatever is left
-    waits for the book to refill at the worst price we took, plus REFILL_PENALTY per share (more when crowded)."""
+    """Expected CAD/share (incl. fees) to trade q shares of one leg: the mid plus half of TENDER_HEDGE_COST
+    (measured on the real heats; see the setting). An empty book means something is broken: make it expensive."""
     if not levels:
-        return mid + sgn * (FEE + 0.10)             # empty book: assume it's expensive
-    best = levels[0][0]
-    share = CROWD_SHARE if share is None else share
-    near = [(px, sz * share) for px, sz in levels if abs(px - best) <= FAST_SLIP + 1e-9]
-    got, cost, last = 0, 0.0, best
-    for px, sz in near:
-        k = min(sz, q - got)
-        if k <= 0:
-            break
-        cost += k * px
-        got += k
-        last = px
-    later = q - got
-    cost += later * (last + sgn * REFILL_PENALTY / max(share, 0.1))
-    return cost / q + sgn * FEE
+        return mid + sgn * (FEE + 0.10)
+    return mid + sgn * TENDER_HEDGE_COST / 2
 
 
 def blocks_to_convert(pos, gl, nl, d_ritc=0):
@@ -478,6 +471,9 @@ def ritc_route(snap, tick):
         return
     levels = snap["books"]["RITC"]["bids" if ST.ritc_plan < 0 else "asks"]
     fast = tick <= ST.fast_until
+    if fast and ST.route_tick == tick:
+        return                                   # fast: once per tick, like the hedge
+    ST.route_tick = tick
     avail = max(levels[0][1] if levels else 0, depth_within(levels, FAST_SLIP if fast else HEDGE_SLIP))
     side = "SELL" if ST.ritc_plan < 0 else "BUY"
     cur = snap["pos"].get("RITC", 0)
@@ -651,8 +647,9 @@ def hedge(snap, tick, orders=None, passive=True):
         levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
         avail = max(levels[0][1] if levels else 0, depth_within(levels, slip))
         plan[leg] = {"gap": gap, "side": side, "urgent": max(0, urgent), "avail": avail, "mine": mine}
-    # 1) market part. Fast: alternate the legs, several clips each, until the gap or the near book runs out.
-    for _ in range(5 if fast else 1):
+    # 1) market part. Fast: once per tick (the book refills between ticks; taking "within FAST_SLIP of the best"
+    #    again in the same tick would walk down the book), alternating the legs, several clips each.
+    for _ in range((5 if passive else 0) if fast else 1):
         sent = False
         for leg, P in plan.items():
             # keep the legs in step: never more than URGENT_GAP ahead of the other leg (it may be waiting on a fill)
@@ -956,7 +953,8 @@ def main():
         if not snap:
             time.sleep(LOOP_SLEEP)
             continue
-        if handle_tenders(snap, tick):
+        took = handle_tenders(snap, tick)
+        if took:
             snap = snapshot_at(tick, ticks) or snap
         ST.last_quotes = snap["q"]
         if quotes_ok(snap["q"]) and tick not in ST.basket_hist:
@@ -966,7 +964,7 @@ def main():
         converters(snap, tick)
         first_of_tick = tick != ST.acted_tick      # slow decisions (resting orders, FX) once per tick
         ST.acted_tick = tick
-        hedge(snap, tick, passive=first_of_tick)
+        hedge(snap, tick, passive=first_of_tick or took)   # a tender just taken: start its hedge now
         if arb(snap, tick):
             hedge(snap, tick, passive=False)
         if first_of_tick:
