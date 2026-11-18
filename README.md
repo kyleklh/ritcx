@@ -9,6 +9,7 @@
 | `etf_algo.py` | ETF arbitrage algorithm. Settings are at the top. |
 | `mock_rit_etf.py` | Local fake RIT server for the ETF case (order books, tenders, shocks, FX, converters). |
 | `convert.py` | MOCK ONLY: stands in for clicking the converters in the RIT Client (talks to the fake server only). |
+| `mock_rit_etf.py --real` | Mock with real book depth/spreads and tenders drawn from the 62 real ones. Good for checking the code runs; NOT for judging P&L (its book refills instantly; it scores the Nov 16 algo at ~+55-80k/heat, real was ~+6k). Judge strategy changes with solo practice + `replay_etf_tenders.py`. |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
 | `replay_etf_tenders.py` | Replays every tender of a real session against its logged books: raw edge, what hedging really cost, and what the current algo would decide. Settings it calibrates (`TENDER_HEDGE_COST`, `TENDER_MIN_EDGE`, `FAST_SLIP`) can be set in `.env`. |
 | `analyze_etf_logs.py` | Reads `logs/` after a session: competitors in the books, book depth, whether price pressure after tenders sticks or bounces, what hedges cost, tender estimate vs result. |
