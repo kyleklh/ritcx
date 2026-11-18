@@ -72,6 +72,12 @@ CLOSE_NEAR = 1.5              # ...only strikes within $1.50 of RTM. Far ITM/OTM
                               # (cash-settled for free; their delta is stable, so they are easy to hedge)
 GAMMA_TRIM_ABOVE = 1.25       # cut gamma only when the book is 25% over the cap...
 GAMMA_ADD_UP_TO = 0.90        # ...and add new risk only up to 90% of it (the gap stops buy/sell ping-pong)
+GAMMA_EDGE_MAX = float(os.environ.get("GAMMA_EDGE_MAX", 1.5))   # a leg still worth more than GAMMA_KEEP_EDGE is
+GAMMA_KEEP_EDGE = float(os.environ.get("GAMMA_KEEP_EDGE", 0.10))  # not cut for gamma until the book is past this many
+                              # caps ($/share; 0.10 = $10/contract). The cap shrinks when a week's vol rises, which is
+                              # exactly when the market maker's vol is far off: test 3 (18 Nov) sold 314 contracts at
+                              # 22% vol to cut gamma, then vol went to 37%. Never adds risk; 0 turns it off.
+GAMMA_EDGE_UNTIL_END = 30     # ...and only until this many ticks before the end (gamma explodes near expiry)
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.2))             # seconds between loops
@@ -382,19 +388,36 @@ def trade_options(info, tick, gcap):
 
 
 def trim_gamma(info, tick, gcap):
-    """As expiry nears, gamma per contract rises. Cut the highest-gamma legs when the book exceeds the cap."""
+    """As expiry nears, gamma per contract rises. Cut the highest-gamma legs when the book exceeds the cap.
+    Legs still holding a big edge (selling them would cross > GAMMA_KEEP_EDGE of fair value) are kept until
+    the book passes GAMMA_EDGE_MAX caps; the others are cut first, as before."""
     book_g = sum(o["pos"] * 100 * o["gamma"] for o in info.values())
     if abs(book_g) <= gcap * GAMMA_TRIM_ABOVE:
         return False
     sg = 1 if book_g > 0 else -1
+    keep_on = GAMMA_EDGE_MAX > 0 and tick < ST.ticks - GAMMA_EDGE_UNTIL_END
+    hard = gcap * max(GAMMA_EDGE_MAX, GAMMA_TRIM_ABOVE)
+
+    def protected(o):
+        # edge given up by closing this leg: long -> sell at bid, short -> buy at ask (both vs fair)
+        crossed = (o["fair"] - o["bid"]) if o["pos"] > 0 else (o["ask"] - o["fair"])
+        return keep_on and crossed > GAMMA_KEEP_EDGE
+
+    # cut low-edge legs first, then (only past the hard cap) the protected ones
+    legs = sorted(info.items(), key=lambda kv: (protected(kv[1]), -sg * kv[1]["pos"] * kv[1]["gamma"]))
     traded = False
     n = 0
-    for tk, o in sorted(info.items(), key=lambda kv: -sg * kv[1]["pos"] * kv[1]["gamma"]):
+    for tk, o in legs:
         if n >= MAX_ORDERS_PER_LOOP or abs(book_g) <= gcap:
             break
         if sg * o["pos"] * o["gamma"] <= 0:
             continue
-        excess = abs(book_g) - gcap
+        if protected(o):
+            if abs(book_g) <= hard:
+                continue
+            excess = abs(book_g) - hard              # protected legs only come back to the hard cap
+        else:
+            excess = abs(book_g) - gcap
         q = min(CLIP, abs(o["pos"]), max(1, int(math.ceil(excess / (100 * o["gamma"])))))
         side = "SELL" if o["pos"] > 0 else "BUY"
         filled = place(tk, side, q)

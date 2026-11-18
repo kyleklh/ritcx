@@ -78,5 +78,48 @@ class FairVolTest(unittest.TestCase):
         self.assertAlmostEqual(va.vol_for_week(4), 0.23)
 
 
+
+class GammaTrimTest(unittest.TestCase):
+    """gamma 0.1/share -> 10 per contract; gcap 1000 = 100 contracts' worth."""
+    def setUp(self):
+        va.ST.reset()
+        va.ST.run_delta = 0
+        va.ST.rtm_pos = 0
+        self.orders = []
+        self._place, self._max = va.place, va.GAMMA_EDGE_MAX
+        va.place = lambda tk, side, q: self.orders.append((tk, side, int(q))) or int(q)
+
+    def tearDown(self):
+        va.place, va.GAMMA_EDGE_MAX = self._place, self._max
+
+    def sold(self, tk=None):
+        return sum(q for t, s, q in self.orders if s == "SELL" and (tk is None or t == tk))
+
+    RICH = {"fair": 1.30, "bid": 1.00, "ask": 1.02}      # long leg worth $0.30/share more than its bid
+
+    def test_rich_legs_kept_below_hard_cap(self):
+        info = make_info({"RTM50C": dict(pos=70, **self.RICH), "RTM50P": dict(pos=60, **self.RICH)})  # 1.3 caps
+        va.trim_gamma(info, 230, 1000)
+        self.assertEqual(self.sold(), 0)
+
+    def test_low_edge_legs_cut_first(self):
+        info = make_info({"RTM50C": dict(pos=100, **self.RICH), "RTM48C": {"pos": 40}})            # 1.4 caps
+        va.trim_gamma(info, 230, 1000)
+        self.assertEqual(self.sold("RTM50C"), 0)
+        self.assertEqual(self.sold("RTM48C"), 40)
+
+    def test_past_hard_cap_trims_back_to_it(self):
+        info = make_info({"RTM50C": dict(pos=100, **self.RICH), "RTM50P": dict(pos=100, **self.RICH)})  # 2.0 caps
+        va.trim_gamma(info, 230, 1000)
+        self.assertEqual(self.sold(), 50)                # back to 1.5 caps, not to 1.0
+
+    def test_off_and_near_expiry_behave_as_before(self):
+        for tick, edge_max in ((230, 0.0), (280, 1.5)):
+            self.orders.clear()
+            va.GAMMA_EDGE_MAX = edge_max
+            info = make_info({"RTM50C": dict(pos=70, **self.RICH), "RTM50P": dict(pos=60, **self.RICH)})
+            va.trim_gamma(info, tick, 1000)
+            self.assertEqual(self.sold(), 30, f"tick {tick} edge_max {edge_max}")
+
 if __name__ == "__main__":
     unittest.main()
