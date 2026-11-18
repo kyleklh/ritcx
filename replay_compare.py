@@ -40,6 +40,8 @@ def heat_files(folder):
 def checkout(ref, tmp):
     if ref == "WORKTREE":
         return HERE
+    if os.path.isdir(ref):                       # a folder holding a vol_algo.py (e.g. a copy with other defaults)
+        return os.path.abspath(ref)
     path = os.path.join(tmp, re.sub(r"\W", "_", ref))
     subprocess.run(["git", "-C", HERE, "worktree", "add", "-q", "--detach", path, ref], check=True)
     return path
@@ -101,7 +103,7 @@ def main():
             print(f"  {min(i + a.parallel, len(jobs))}/{len(jobs)} runs done", flush=True)
     finally:
         for r, path in codes.items():
-            if path != HERE:
+            if path != HERE and not os.path.isdir(r):
                 subprocess.run(["git", "-C", HERE, "worktree", "remove", "--force", path])
     for x in sorted(res, key=lambda x: (x[1], x[0])):
         print(f"  {os.path.basename(x[1].rstrip('/')):<12} {x[0][:14]:<14} " +
