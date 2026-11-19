@@ -74,6 +74,8 @@ class Sim:
         self.penalty = 0.0
         self.news = []
         self.orders = []
+        self.volume = {t: 0 for t in TICKERS}   # market volume per ticker (all traders; here only us)
+        self.tas = []                            # time & sales: every trade in the market
         # (the real server's t=1 message is added in step(); nothing is published at tick 0)
 
     # ---------- pricing ----------
@@ -209,6 +211,9 @@ class Sim:
                  "type": "MARKET", "quantity": qty, "action": action, "price": None,
                  "quantity_filled": qty, "vwap": px, "status": "TRANSACTED"}
             self.orders.append(o)
+            self.volume[ticker] += qty
+            self.tas.append({"id": len(self.tas) + 1, "period": 1, "tick": self.tick, "ticker": ticker,
+                             "price": px, "quantity": qty})
             return 200, o
 
     # ---------- API views ----------
@@ -219,6 +224,7 @@ class Sim:
             out.append({"ticker": t, "type": "STOCK" if t == "RTM" else "OPTION", "size": SIZE[t],
                         "position": self.pos[t], "last": round(self.mid(t), 2), "bid": bid, "ask": ask,
                         "bid_size": 1_000_000, "ask_size": 1_000_000, "is_tradeable": True,
+                        "volume": self.volume[t],
                         "max_trade_size": MAX_ORDER[t], "trading_fee": FEE[t]})
         return out
 
@@ -267,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
                 bid, ask = s.quote(q.get("ticker", "RTM"))
                 return self._send(200, {"bids": [{"price": bid, "quantity": 1_000_000}],
                                         "asks": [{"price": ask, "quantity": 1_000_000}]})
+            if u.path == "/v1/securities/tas":
+                after = int(q.get("after", 0))
+                rows = [{k: v for k, v in x.items() if k != "ticker"} for x in s.tas
+                        if x["ticker"] == q.get("ticker") and x["id"] > after]
+                return self._send(200, list(reversed(rows)))   # newest first, like RIT
             if u.path == "/v1/news":
                 since = int(q.get("since", 0))
                 items = [n for n in s.news if n["news_id"] > since]

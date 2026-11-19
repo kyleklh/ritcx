@@ -149,11 +149,104 @@ def place(ticker, action, qty):
             if not r.ok:
                 say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120]}")
                 return 0
-            return int(r.json().get("quantity_filled", qty))
+            j = r.json()
+            filled = int(j.get("quantity_filled", qty))
+            MKT.fill(ticker, action, filled, j.get("vwap"))
+            return filled
         except requests.RequestException as e:
             say(f"[warn] order failed: {e}")
             time.sleep(0.2)
     return 0
+
+
+# ------------------------------- market log (read-only) -------------------------------
+class MarketLog:
+    """Background thread, own HTTP session, never trades. Per heat folder it writes
+      quotes.csv  tick, ticker, bid, ask, last, volume       (every tick, all 11 tickers; volume = market total)
+      tas.csv     tick, ticker, id, price, quantity          (every trade in the market, if the server has
+                                                              /securities/tas; RIT lists all traders' trades)
+      fills.csv   tick, ticker, action, quantity, vwap       (our own fills, to subtract from the market)
+    analyze_market.py turns these into the other teams' volume, side and timing per strike."""
+    TICKERS = ["RTM"] + [f"RTM{k}{c}" for k in STRIKES for c in "CP"]
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.files = {}
+        self.tick = 0
+        self.last_q_tick = -1
+        self.after = {}
+        self.tas_ok = True
+        self.started = False
+
+    def set_folder(self, folder):
+        with self.lock:
+            for f, _ in self.files.values():
+                f.close()
+            self.files = {}
+            for name, cols in (("quotes", ["tick", "ticker", "bid", "ask", "last", "volume"]),
+                               ("tas", ["tick", "ticker", "id", "price", "quantity"]),
+                               ("fills", ["tick", "ticker", "action", "quantity", "vwap"])):
+                f = open(os.path.join(folder, f"{name}.csv"), "w", newline="")
+                w = csv.writer(f)
+                w.writerow(cols)
+                self.files[name] = (f, w)
+            self.after = {}
+            self.last_q_tick = -1
+        if not self.started:
+            self.started = True
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _write(self, name, row):
+        with self.lock:
+            if name in self.files:
+                self.files[name][1].writerow(row)
+
+    def _flush(self):
+        with self.lock:
+            for f, _ in self.files.values():
+                f.flush()
+
+    def fill(self, ticker, action, qty, vwap):
+        if qty:
+            self._write("fills", [ST.last_tick, ticker, action, qty, vwap])
+
+    def _run(self):
+        ses = requests.Session()
+        ses.headers.update({"X-API-Key": API_KEY})
+        while not ST.quit:
+            try:
+                case = ses.get(f"{API}/case", timeout=2).json()
+                self.tick = case.get("tick", 0)
+                if case.get("status") == "ACTIVE" and self.tick != self.last_q_tick:
+                    self.last_q_tick = self.tick
+                    for x in ses.get(f"{API}/securities", timeout=2).json():
+                        self._write("quotes", [self.tick, x.get("ticker"), x.get("bid"), x.get("ask"),
+                                               x.get("last"), x.get("volume")])
+                if self.tas_ok and case.get("status") == "ACTIVE":
+                    for tk in self.TICKERS:
+                        params = {"ticker": tk}
+                        if tk in self.after:
+                            params["after"] = self.after[tk]
+                        r = ses.get(f"{API}/securities/tas", params=params, timeout=2)
+                        if r.status_code in (404, 405, 501):
+                            self.tas_ok = False
+                            say("[market log] this server has no time & sales; logging quotes + volume only")
+                            break
+                        if not r.ok:
+                            continue
+                        rows = r.json()
+                        rows = rows if isinstance(rows, list) else rows.get("data", [])
+                        for t in sorted(rows, key=lambda t: t.get("id", 0)):
+                            if t.get("id", 0) > self.after.get(tk, -1):
+                                self._write("tas", [t.get("tick"), tk, t.get("id"), t.get("price"), t.get("quantity")])
+                                self.after[tk] = t.get("id", 0)
+                self._flush()
+            except (requests.RequestException, ValueError):
+                pass
+            time.sleep(0.25)
+
+
+MKT = MarketLog()
 
 
 # ------------------------------- news & vol -------------------------------
@@ -525,7 +618,8 @@ def hedge(sec, info, tick, force=False):
 
 
 def open_heat_logs(old=None):
-    """Start a fresh folder for this heat: logs/vol/<date_time>/ with vol_log.csv, news_raw.txt, console.txt."""
+    """Start a fresh folder for this heat: logs/vol/<date_time>/ with vol_log.csv, news_raw.txt, console.txt,
+    and the market log (quotes.csv, tas.csv, fills.csv; see MarketLog)."""
     if old:
         old.close()
     folder = os.path.join(LOG_ROOT, f"{datetime.now():%Y%m%d_%H%M%S}")
@@ -542,6 +636,7 @@ def open_heat_logs(old=None):
     logf = open(os.path.join(folder, "vol_log.csv"), "w", newline="")
     log = csv.writer(logf)
     log.writerow(["tick", "S", "fair_vol", "atm_iv", "net_contracts", "delta", "nlv"])
+    MKT.set_folder(folder)
     say(f"[log] this heat is saved in {folder}")
     return logf, log
 

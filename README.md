@@ -88,6 +88,16 @@ Old flat files (`vol_log_X.csv` + `news_raw_X.txt`, several heats each) can be s
 
     python organize_logs.py path\to\old_files
 
+### What are the other teams trading?
+
+Each heat folder also gets `quotes.csv` (all quotes and market volume every tick), `tas.csv` (every trade in the
+market, from RIT's time & sales) and `fills.csv` (our own fills). A background thread writes them and never trades.
+
+    python analyze_market.py logs/vol/20261120_101500
+
+removes our own trades from the tape and shows the rest: volume and side per option, the others' estimated
+position (peak net and gross), and when they traded, with the week starts (t=76, 151, 226) called out.
+
 ### Check once you have practice-server access
 
 - [ ] Exact wording of the vol news (the parser expects "will be 20%" and "between 27% and 30%").
