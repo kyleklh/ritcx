@@ -45,7 +45,8 @@ def parse_option(t):
 
 
 class Sim:
-    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0, reset_sd=0.0):
+    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0, reset_sd=0.0,
+                 strike_sd=0.0, strike_rho=0.35):
         self.rng = random.Random(seed)
         self.tick_seconds = tick_seconds
         self.ticks = ticks
@@ -58,7 +59,10 @@ class Sim:
         alt = random.Random(None if seed is None else seed + 1_000_000)
         self.alt = alt
         self.range_miss = range_miss
-        self.reset_sd = reset_sd        # real server (16 Nov logs): at each week start the MM's vol JUMPS to
+        self.reset_sd = reset_sd
+        self.strike_sd, self.strike_rho = strike_sd, strike_rho   # real server (19 Nov): each strike's vol is
+        self.dev = {k: 0.0 for k in STRIKES}                        # re-drawn every tick, sd ~1.2 pts, lag-1 corr 0.35
+        self.noise = random.Random(None if seed is None else seed + 2_000_000)        # real server (16 Nov logs): at each week start the MM's vol JUMPS to
                                         # roughly true vol +- 15 pts (often the wrong way), then drifts back
         if mm_start is None:
             mm_start = 0.25
@@ -86,7 +90,7 @@ class Sim:
         if t == "RTM":
             return self.S
         K, f = parse_option(t)
-        return bs.price(f, self.S, K, self.T(), self.mm_vol)
+        return bs.price(f, self.S, K, self.T(), max(0.01, self.mm_vol + self.dev[K]))
 
     def quote(self, t):
         m = self.mid(t)
@@ -128,6 +132,10 @@ class Sim:
             # market maker learns the true vol with a lag
             k = 1 - 0.5 ** (1 / self.half_life)
             self.mm_vol += (sigma - self.mm_vol) * k
+            if self.strike_sd:
+                for k in STRIKES:
+                    self.dev[k] = (self.strike_rho * self.dev[k] +
+                                   math.sqrt(1 - self.strike_rho ** 2) * self.noise.gauss(0, self.strike_sd))
             if self.reset_sd and w > 1 and self.tick == (w - 1) * self.week_len + 1:
                 self.mm_vol = max(0.05, sigma + self.alt.gauss(0, self.reset_sd))
             # news
@@ -307,7 +315,7 @@ def run_clock(args):
     seed = args.seed
     while True:
         SIM = Sim(args.tick, seed, half_life=args.half_life, mm_start=args.mm_start, range_miss=args.range_miss,
-                  reset_sd=args.reset_sd)
+                  reset_sd=args.reset_sd, strike_sd=args.strike_sd)
         print(f"[mock] new heat, seed={seed}. (true vols hidden; printed at the end)", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -327,6 +335,8 @@ def main():
     p.add_argument("--half-life", type=float, default=20.0, help="ticks for market maker to close half the vol gap")
     p.add_argument("--mm-start", type=float, default=None, help="market maker's starting vol (-1 = random 15-40%%)")
     p.add_argument("--range-miss", type=float, default=0.0, help="probability a forecast range misses the true vol")
+    p.add_argument("--strike-sd", type=float, default=0.0,
+                   help="per-strike vol noise each tick, like the real server (try 0.012)")
     p.add_argument("--reset-sd", type=float, default=0.0,
                    help="MM vol jumps to true vol + N(0, this) at each week start, like the real server (try 0.15)")
     p.add_argument("--start-delay", type=float, default=2.0)

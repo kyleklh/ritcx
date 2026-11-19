@@ -52,8 +52,10 @@ def run_batch(jobs, tick, loop_sleep):
     procs = []
     for j, (label, heat, code, csv_path, news, rep) in enumerate(jobs):
         port = 9800 + j
+        qpath = os.path.join(os.path.dirname(csv_path), "quotes.csv")
         args = ["--csv", csv_path, "--port", str(port), "--tick", str(tick), "--start-delay", "1.5",
-                "--jitter-seed", str(rep)] + (["--news", news] if news else [])
+                "--jitter-seed", str(rep)] + (["--news", news] if news else []) + \
+               (["--quotes", qpath] if os.path.exists(qpath) else [])
         srv = subprocess.Popen([sys.executable, os.path.join(HERE, "replay_rit_vol.py")] + args,
                                cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         procs.append((label, heat, code, port, srv))

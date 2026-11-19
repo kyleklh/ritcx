@@ -13,6 +13,8 @@ def make_info(overrides):
                         "gamma": 0.1, "pos": 0}
     for tk, kv in overrides.items():
         info[tk].update(kv)
+    for o in info.values():
+        o.setdefault("pos_total", o["pos"])
     return info
 
 
@@ -120,6 +122,80 @@ class GammaTrimTest(unittest.TestCase):
             info = make_info({"RTM50C": dict(pos=70, **self.RICH), "RTM50P": dict(pos=60, **self.RICH)})
             va.trim_gamma(info, tick, 1000)
             self.assertEqual(self.sold(), 30, f"tick {tick} edge_max {edge_max}")
+
+
+class StrikeArbTest(unittest.TestCase):
+    """Strike-vs-strike engine: S=50, T=0.06, all strikes 25% vol except the ones a test moves."""
+    S, T = 50.0, 0.06
+
+    def setUp(self):
+        va.ST.reset()
+        va.ST.run_delta = 0
+        va.ST.rtm_pos = 0
+        self.orders, self.net_path = [], []
+        self._place = va.place
+        va.place = self.fake_place
+
+    def tearDown(self):
+        va.place = self._place
+
+    def fake_place(self, tk, side, q):
+        self.orders.append((tk, side, int(q)))
+        return int(q)
+
+    def info(self, ivs, main_net=0):
+        sec = {}
+        for k in va.STRIKES:
+            for f, tk in (("c", va.CALLS[k]), ("p", va.PUTS[k])):
+                px = va.bs.price(f, self.S, k, self.T, ivs.get(k, 0.25))
+                sec[tk] = {"bid": round(px - 0.01, 2), "ask": round(px + 0.01, 2), "position": 0}
+        sec["RTM50C"]["position"] = main_net
+        return va.option_info(sec, self.S, self.T, 0.25)
+
+    def net_of(self):
+        return sum(q if s == "BUY" else -q for t, s, q in self.orders if t != "RTM")
+
+    def test_straddle_is_delta_neutral(self):
+        info = self.info({})
+        for k in va.STRIKES:
+            legs = va.straddle(info, k, 700)
+            d = sum(n * info[tk]["delta"] for tk, n in legs.items())
+            self.assertEqual(sum(legs.values()), 700)
+            self.assertLess(abs(d), 1.0, f"strike {k}")
+
+    def test_orders_alternate_so_net_never_runs_away(self):
+        info = self.info({}, main_net=950)
+        va.arb_orders(info, 10, {"RTM49C": 300, "RTM49P": 400}, {"RTM51C": 350, "RTM51P": 350})
+        running, worst = 0, 0
+        for tk, side, q in self.orders:
+            if tk != "RTM":
+                running += q if side == "BUY" else -q
+                worst = max(worst, running)
+        self.assertLessEqual(worst, 0)                 # main book is long 950: sells go first, never above it
+        self.assertEqual(self.net_of(), 0)
+
+    def test_enters_on_big_gap_buying_cheap_selling_rich(self):
+        info = self.info({49: 0.20, 51: 0.30})
+        va.arb_step(info, 10, self.S, self.T)
+        self.assertEqual(va.ST.arb["long_k"], 49)
+        self.assertEqual(va.ST.arb["short_k"], 51)
+        self.assertEqual(self.net_of(), 0)
+        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM49")), 700)
+        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM51")), -700)
+
+    def test_small_gap_is_ignored(self):
+        info = self.info({49: 0.248, 51: 0.252})        # 0.4 pts: a few $ per contract, below the threshold
+        va.arb_step(info, 10, self.S, self.T)
+        self.assertIsNone(va.ST.arb)
+        self.assertEqual(self.orders, [])
+
+    def test_unwinds_when_gap_closes(self):
+        va.arb_step(self.info({49: 0.20, 51: 0.30}), 10, self.S, self.T)
+        self.orders.clear()
+        va.arb_step(self.info({49: 0.255, 51: 0.245}), 11, self.S, self.T)  # gap closed (1 pt the other way: too small to re-enter)
+        self.assertIsNone(va.ST.arb)
+        self.assertFalse(any(va.ST.arb_pos.values()))
+        self.assertEqual(self.net_of(), 0)
 
 if __name__ == "__main__":
     unittest.main()

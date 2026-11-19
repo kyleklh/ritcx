@@ -78,6 +78,15 @@ GAMMA_KEEP_EDGE = float(os.environ.get("GAMMA_KEEP_EDGE", 0.10))  # not cut for 
                               # exactly when the market maker's vol is far off: test 3 (18 Nov) sold 314 contracts at
                               # 22% vol to cut gamma, then vol went to 37%. Never adds risk; 0 turns it off.
 GAMMA_EDGE_UNTIL_END = 30     # ...and only until this many ticks before the end (gamma explodes near expiry)
+ARB_ON = os.environ.get("ARB", "1") == "1"   # strike-vs-strike engine (see arb_step); ARB=0 turns it off
+ARB_MIN_DOLLARS = float(os.environ.get("ARB_MIN_DOLLARS", 16))   # enter when (rich - cheap strike vol) x vega >= this
+                              # per contract. The market maker re-draws each strike's vol every tick (sd ~1.2 pts,
+                              # spread across strikes median 2 pts, 90th pct 5 pts, 18 Nov test 8). Backtest on that
+                              # heat's real quotes: $12-30 all profitable (+$50k..+$280k), $16 -> +$242k.
+ARB_EXIT = float(os.environ.get("ARB_EXIT", 0.0))   # leave when the gap (vol pts) has closed to this...
+ARB_MAX_HOLD = int(os.environ.get("ARB_MAX_HOLD", 5))   # ...or after this many ticks
+ARB_SIZE = int(os.environ.get("ARB_SIZE", 700))   # contracts per leg (capped by the gross room left)
+ARB_LAST_ENTRY = 30           # no new pairs in the last N ticks; all unwound before the t=285 close-out
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.2))             # seconds between loops
@@ -114,6 +123,8 @@ class State:
         self.book_dir = 0         # +1 long / -1 short: the direction the book last had, kept while flat
         self.hedge_acc = 0        # RTM shares bought(+)/sold(-) this tick
         self.news_file = os.devnull
+        self.arb_pos = {}         # ticker -> contracts held by the strike engine (the main book sees the rest)
+        self.arb = None           # open pair: dict(long_k, short_k, t0)
 
 
 ST = State()
@@ -360,7 +371,8 @@ def option_info(sec, S, T, fv):
                 "sell_edge": bid - fair - OPT_FEE_PER_SHARE if bid > 0 else -1.0,
                 "delta": bs.delta(flag, S, k, T, d_vol, RISK_FREE),
                 "gamma": bs.gamma(S, k, T, d_vol, RISK_FREE),
-                "pos": int(x["position"]),
+                "pos": int(x["position"]) - ST.arb_pos.get(tk, 0),   # main book's share
+                "pos_total": int(x["position"]),
             }
     return out
 
@@ -368,7 +380,7 @@ def option_info(sec, S, T, fv):
 def portfolio_delta(sec, info):
     d = int(sec["RTM"]["position"])
     for tk, o in info.items():
-        d += o["pos"] * 100 * o["delta"]
+        d += o["pos_total"] * 100 * o["delta"]
     return d
 
 
@@ -401,7 +413,7 @@ def trade_options(info, tick, gcap):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
     net = sum(o["pos"] for o in info.values())
-    gross = sum(abs(o["pos"]) for o in info.values())
+    gross = sum(abs(o["pos_total"]) for o in info.values())   # the gross limit counts the strike engine too
     # candidate trades ranked by $ edge per contract
     # Rank by edge, but trades that CLOSE an existing position go first: when the view flips,
     # buying back old shorts beats opening offsetting longs at a nearby strike (saves fees + limit room).
@@ -462,10 +474,12 @@ def trade_options(info, tick, gcap):
             sgn = 1 if side == "BUY" else -1
             old = info[tk]["pos"]
             info[tk]["pos"] = old + sgn * filled
+            old_total = info[tk]["pos_total"]
+            info[tk]["pos_total"] = old_total + sgn * filled
             net += sgn * filled
             opt_delta += sgn * filled * 100 * info[tk]["delta"]
             book_g += sgn * filled * 100 * info[tk]["gamma"]
-            gross += abs(old + sgn * filled) - abs(old)
+            gross += abs(old_total + sgn * filled) - abs(old_total)
             traded = True
             ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
             if abs(ST.run_delta) > HEDGE_TRIGGER:
@@ -477,6 +491,99 @@ def trade_options(info, tick, gcap):
     for k, (qty, edge) in fills.items():
         prev = ST.fill_acc.get(k, (0, edge))[0]
         ST.fill_acc[k] = (prev + qty, edge)
+    return traded
+
+
+def strike_ivs(info):
+    """Each strike's implied vol (call and put agree on the real server)."""
+    out = {}
+    for k in STRIKES:
+        c, p = info[CALLS[k]]["iv"], info[PUTS[k]]["iv"]
+        if c and p:
+            out[k] = (c + p) / 2
+    return out
+
+
+def straddle(info, k, n):
+    """Delta-neutral straddle of n contracts at strike k: calls n(1-dc), puts n*dc."""
+    dc = info[CALLS[k]]["delta"]
+    nc = int(round(n * (1 - dc)))
+    return {CALLS[k]: nc, PUTS[k]: n - nc}
+
+
+def arb_orders(info, tick, buys, sells):
+    """Trade two baskets in 100-lots so the net position never goes beyond where it started in the direction
+    away from zero (the main book may be at the net limit): trade the side that moves net toward zero first,
+    and size each opposite clip to at most the buffer built so far."""
+    net = sum(o["pos_total"] for o in info.values())
+    good = "SELL" if net > 0 else "BUY"                  # side that moves net toward zero
+    bad = "BUY" if good == "SELL" else "SELL"
+    queues = {"BUY": [[tk, n] for tk, n in buys.items() if n > 0],
+              "SELL": [[tk, n] for tk, n in sells.items() if n > 0]}
+    buffer = 0                                           # contracts moved toward zero, not yet given back
+    traded = False
+    while queues["BUY"] or queues["SELL"]:
+        if queues[good] and (buffer <= 0 or not queues[bad]):
+            side, cap = good, CLIP
+        else:
+            side, cap = bad, (min(CLIP, buffer) if queues[good] else CLIP)
+        item = queues[side][0]
+        tk, rem = item
+        q = min(cap, rem)
+        filled = place(tk, side, q)
+        sgn = 1 if side == "BUY" else -1
+        if filled > 0:
+            traded = True
+            ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
+            info[tk]["pos_total"] += sgn * filled
+            ST.run_delta += sgn * filled * 100 * info[tk]["delta"]   # hedged once at the end: the baskets are
+            buffer += filled if side == good else -filled            # delta-neutral, half-built ones are not
+        item[1] -= filled if filled > 0 else q          # a rejected clip is dropped, not retried
+        if item[1] <= 0:
+            queues[side].pop(0)
+    if abs(ST.run_delta) > HEDGE_TRIGGER:
+        ST.run_delta = quick_hedge(tick, ST.run_delta)
+    return traded
+
+
+def arb_step(info, tick, S, T):
+    """Strike-vs-strike engine. The market maker re-draws each strike's vol every tick around a common level.
+    Buy a delta-neutral straddle at the cheapest strike, sell one at the richest, both N contracts, so net
+    contracts stay zero (the main book keeps the whole net limit; this uses gross room). Leave when the gap
+    has closed, after ARB_MAX_HOLD ticks, or before the end-of-heat close-out."""
+    if not ARB_ON:
+        return False
+    ivs = strike_ivs(info)
+    traded = False
+    end = ST.ticks - CLOSE_TICKS_BEFORE_END - 1
+    if ST.arb:
+        a = ST.arb
+        gap = (ivs[a["short_k"]] - ivs[a["long_k"]]) * 100 if a["short_k"] in ivs and a["long_k"] in ivs else 0
+        if gap <= ARB_EXIT or tick - a["t0"] >= ARB_MAX_HOLD or tick >= end:
+            held = {tk: n for tk, n in ST.arb_pos.items() if n}
+            traded = arb_orders(info, tick, {tk: -n for tk, n in held.items() if n < 0},
+                                {tk: n for tk, n in held.items() if n > 0})
+            event(tick, "ARB", f"out: {a['long_k']}/{a['short_k']} after {tick - a['t0']} ticks, gap now {gap:+.1f} pts")
+            if not any(ST.arb_pos.values()):
+                ST.arb = None
+            else:
+                return traded                            # something didn't fill: finish unwinding next loop
+    if ST.arb or ST.paused or tick >= ST.ticks - ARB_LAST_ENTRY or len(ivs) < 2:
+        return traded
+    lk, sk = min(ivs, key=ivs.get), max(ivs, key=ivs.get)
+    gap = (ivs[sk] - ivs[lk]) * 100
+    vega = (bs.vega(S, lk, T, ivs[lk]) + bs.vega(S, sk, T, ivs[sk])) / 2     # $ per contract per vol point
+    if gap * vega < ARB_MIN_DOLLARS:
+        return traded
+    gross = sum(abs(o["pos_total"]) for o in info.values())
+    n = min(ARB_SIZE, (MAX_GROSS_CONTRACTS - gross) // 2)
+    if n < CLIP:
+        return traded
+    buys, sells = straddle(info, lk, n), straddle(info, sk, n)
+    traded = arb_orders(info, tick, buys, sells) or traded
+    ST.arb = {"long_k": lk, "short_k": sk, "t0": tick}
+    event(tick, "ARB", f"in: buy {lk} straddle, sell {sk} straddle, {n} each; gap {gap:.1f} pts "
+                       f"(${gap * vega:,.0f}/contract)")
     return traded
 
 
@@ -734,6 +841,10 @@ def main():
         info = option_info(sec, S, T, fv)
         ST.rtm_pos = int(sec["RTM"]["position"])
         ST.run_delta = portfolio_delta(sec, info)
+        if arb_step(info, tick, S, T):
+            sec = snapshot() or sec
+            info = option_info(sec, S, T, fv)
+            ST.run_delta = portfolio_delta(sec, info)
         if tick >= ST.ticks - CLOSE_TICKS_BEFORE_END:
             traded = close_options(info, tick, S)
         else:
