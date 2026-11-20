@@ -197,5 +197,43 @@ class StrikeArbTest(unittest.TestCase):
         self.assertFalse(any(va.ST.arb_pos.values()))
         self.assertEqual(self.net_of(), 0)
 
+
+class StrikeArbLimitTest(StrikeArbTest):
+    """Same as StrikeArbTest but the fake server enforces the 1,000 net limit like RIT does."""
+    def fake_place(self, tk, side, q):
+        if tk != "RTM":
+            sgn = 1 if side == "BUY" else -1
+            if abs(self.total_net + sgn * q) > 1000:
+                self.orders.append((tk, "REJECTED", int(q)))
+                return 0
+            self.total_net += sgn * q
+        self.orders.append((tk, side, int(q)))
+        return int(q)
+
+    def setUp(self):
+        super().setUp()
+        self.total_net = 0
+
+    def test_lopsided_leftovers_unwind_with_main_book_at_limit(self):
+        # main book long 950; the engine was left holding a lopsided pair (more shorts than longs)
+        self.total_net = 950 + 300 - 500
+        va.ST.arb_pos = {"RTM49C": 120, "RTM49P": 180, "RTM51C": -300, "RTM51P": -200}
+        va.ST.arb = {"long_k": 49, "short_k": 51, "t0": 5}
+        info = self.info({49: 0.255, 51: 0.245}, main_net=950)
+        for tk, n in va.ST.arb_pos.items():
+            info[tk]["pos_total"] += n
+        va.arb_step(info, 11, self.S, self.T)
+        self.assertFalse(any(va.ST.arb_pos.values()))
+        self.assertIsNone(va.ST.arb)
+        self.assertNotIn("REJECTED", [s for _, s, _ in self.orders])
+
+    def test_main_book_leaves_room_for_engine_legs(self):
+        # engine holds a pair that is net +100; the main book must count it and stop at 950 total
+        va.ST.arb_pos = {"RTM49C": 400, "RTM51C": -300}
+        info = make_info({"RTM48C": {"pos": 850, "pos_total": 850}, "RTM49C": {"pos": 0, "pos_total": 400},
+                          "RTM51C": {"pos": 0, "pos_total": -300}, "RTM50C": {"buy_edge": 0.5}})
+        va.trade_options(info, 50, gcap=1e9)
+        self.assertEqual(sum(q for tk, sd, q in self.orders if sd == "BUY" and tk != "RTM"), 0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -412,8 +412,8 @@ def quick_hedge(tick, d):
 def trade_options(info, tick, gcap):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
-    net = sum(o["pos"] for o in info.values())
-    gross = sum(abs(o["pos_total"]) for o in info.values())   # the gross limit counts the strike engine too
+    net = sum(o["pos_total"] for o in info.values())          # both limits count the strike engine's legs:
+    gross = sum(abs(o["pos_total"]) for o in info.values())   # a lopsided pair must not push us over
     # candidate trades ranked by $ edge per contract
     # Rank by edge, but trades that CLOSE an existing position go first: when the view flips,
     # buying back old shorts beats opening offsetting longs at a nearby strike (saves fees + limit room).
@@ -541,9 +541,32 @@ def arb_orders(info, tick, buys, sells):
         item[1] -= filled if filled > 0 else q          # a rejected clip is dropped, not retried
         if item[1] <= 0:
             queues[side].pop(0)
+    arb_rebalance(info)
     if abs(ST.run_delta) > HEDGE_TRIGGER:
         ST.run_delta = quick_hedge(tick, ST.run_delta)
     return traded
+
+
+def arb_rebalance(info):
+    """Keep the engine's own net at zero. A rejected clip can leave one side bigger; trim that side by closing
+    the engine's own contracts (always allowed: it moves the total net back toward the main book's)."""
+    for _ in range(20):
+        excess = sum(ST.arb_pos.values())
+        if excess == 0:
+            return
+        side = "SELL" if excess > 0 else "BUY"
+        legs = [tk for tk, n in ST.arb_pos.items() if (n > 0 if excess > 0 else n < 0)]
+        if not legs:
+            return
+        tk = max(legs, key=lambda t: abs(ST.arb_pos[t]))
+        q = min(CLIP, abs(excess), abs(ST.arb_pos[tk]))
+        filled = place(tk, side, q)
+        if filled <= 0:
+            return
+        sgn = 1 if side == "BUY" else -1
+        ST.arb_pos[tk] += sgn * filled
+        info[tk]["pos_total"] += sgn * filled
+        ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
 
 
 def arb_step(info, tick, S, T):
@@ -567,7 +590,13 @@ def arb_step(info, tick, S, T):
             if not any(ST.arb_pos.values()):
                 ST.arb = None
             else:
-                return traded                            # something didn't fill: finish unwinding next loop
+                a["fails"] = a.get("fails", 0) + 1
+                if a["fails"] < 3:
+                    return traded                        # something didn't fill: try again next loop
+                left = ", ".join(f"{tk}:{n:+d}" for tk, n in ST.arb_pos.items() if n)
+                event(tick, "ARB", f"could not unwind {left}; the main book takes them over")
+                ST.arb_pos = {}
+                ST.arb = None
     if ST.arb or ST.paused or tick >= ST.ticks - ARB_LAST_ENTRY or len(ivs) < 2:
         return traded
     lk, sk = min(ivs, key=ivs.get), max(ivs, key=ivs.get)
