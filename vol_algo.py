@@ -80,6 +80,7 @@ GAMMA_KEEP_EDGE = float(os.environ.get("GAMMA_KEEP_EDGE", 0.10))  # not cut for 
                               # 22% vol to cut gamma, then vol went to 37%. Never adds risk; 0 turns it off.
 GAMMA_EDGE_UNTIL_END = 30     # ...and only until this many ticks before the end (gamma explodes near expiry)
 ARB_ON = os.environ.get("ARB", "1") == "1"   # strike-vs-strike engine (see arb_step); ARB=0 turns it off
+ARB_MIN_BID = float(os.environ.get("ARB_MIN_BID", 0.02))   # skip strikes with an option bid at the 1-cent floor
 ARB_MIN_DOLLARS = float(os.environ.get("ARB_MIN_DOLLARS", 10))   # enter when (rich - cheap strike vol) x vega >= this
                               # per contract. The market maker re-draws each strike's vol every tick (sd ~1.2 pts,
                               # spread across strikes median 2 pts, 90th pct 5 pts, 18 Nov test 8). Backtest on that
@@ -653,6 +654,12 @@ def arb_step(info, tick, S, T):
                 ST.arb_pos = {}
                 ST.arb = None
     if ST.arb or ST.paused or tick >= ST.ticks - ARB_LAST_ENTRY or len(ivs) < 2:
+        return traded
+    # A strike whose call or put is bid at the 1-cent floor has a fake vol: the far option is worth ~0 and the
+    # near one ~intrinsic, so a 1-cent rounding moves its vol by many points. Its "gap" is pure fees and spread.
+    ivs = {k: v for k, v in ivs.items()
+           if min(info[CALLS[k]]["bid"], info[PUTS[k]]["bid"]) >= ARB_MIN_BID - 1e-9}
+    if len(ivs) < 2:
         return traded
     lk, sk = min(ivs, key=ivs.get), max(ivs, key=ivs.get)
     gap = (ivs[sk] - ivs[lk]) * 100

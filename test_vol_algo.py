@@ -189,6 +189,14 @@ class StrikeArbTest(unittest.TestCase):
         self.assertIsNone(va.ST.arb)
         self.assertEqual(self.orders, [])
 
+    def test_floor_quoted_strike_is_ignored(self):
+        # live heat 130427, t=253: 52C quoted 0.01/0.03 at 8% vol made strike 52 look 11 pts rich. Fake gap.
+        info = self.info({52: 0.40})
+        info["RTM52C"]["bid"] = 0.01
+        va.arb_step(info, 10, self.S, self.T)
+        self.assertNotIn("RTM52C", {t for t, s, q in self.orders})
+        self.assertNotIn("RTM52P", {t for t, s, q in self.orders})
+
     def test_unwinds_when_gap_closes(self):
         va.arb_step(self.info({49: 0.20, 51: 0.30}), 10, self.S, self.T)
         self.orders.clear()
