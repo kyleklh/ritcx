@@ -187,14 +187,14 @@ class Sim:
               f"(fees {self.fees:,.2f}, penalty {self.penalty:,.2f})", flush=True)
 
     # ---------- orders ----------
-    def order(self, ticker, action, qty, otype):
+    def order(self, ticker, action, qty, otype, price=None):
         with self.lock:
             if self.status != "ACTIVE":
                 return 400, {"code": "INVALID", "message": "Case is not active"}
             if ticker not in TICKERS:
                 return 400, {"code": "INVALID", "message": "Unknown ticker"}
-            if otype != "MARKET":
-                return 400, {"code": "INVALID", "message": "Mock supports MARKET orders only"}
+            if otype not in ("MARKET", "LIMIT") or (otype == "LIMIT" and price is None):
+                return 400, {"code": "INVALID", "message": "MARKET, or LIMIT with a price"}
             if qty <= 0 or qty > MAX_ORDER[ticker]:
                 return 400, {"code": "INVALID", "message": f"Quantity must be 1..{MAX_ORDER[ticker]}"}
             sign = 1 if action == "BUY" else -1
@@ -210,13 +210,22 @@ class Sim:
                     return 400, {"code": "INVALID", "message": "Options limit exceeded"}
             bid, ask = self.quote(ticker)
             px = ask if sign > 0 else bid
+            if otype == "LIMIT" and (price < px - 1e-9 if sign > 0 else price > px + 1e-9):
+                # not marketable: rests (unfilled) until cancelled. Like RIT it could fill later; the algo cancels
+                # straight away, so the mock never fills it.
+                oid = len(self.orders) + 1
+                o = {"order_id": oid, "period": 1, "tick": self.tick, "trader_id": "mock", "ticker": ticker,
+                     "type": "LIMIT", "quantity": qty, "action": action, "price": price,
+                     "quantity_filled": 0, "vwap": None, "status": "OPEN"}
+                self.orders.append(o)
+                return 200, o
             fee = FEE[ticker] * qty
             self.cash -= sign * qty * SIZE[ticker] * px + fee
             self.fees += fee
             self.pos = new
             oid = len(self.orders) + 1
             o = {"order_id": oid, "period": 1, "tick": self.tick, "trader_id": "mock", "ticker": ticker,
-                 "type": "MARKET", "quantity": qty, "action": action, "price": None,
+                 "type": otype, "quantity": qty, "action": action, "price": price,
                  "quantity_filled": qty, "vwap": px, "status": "TRANSACTED"}
             self.orders.append(o)
             self.volume[ticker] += qty
@@ -281,6 +290,11 @@ class Handler(BaseHTTPRequestHandler):
                 bid, ask = s.quote(q.get("ticker", "RTM"))
                 return self._send(200, {"bids": [{"price": bid, "quantity": 1_000_000}],
                                         "asks": [{"price": ask, "quantity": 1_000_000}]})
+            if u.path.startswith("/v1/orders/"):
+                for o in s.orders:
+                    if str(o["order_id"]) == u.path.rsplit("/", 1)[1]:
+                        return self._send(200, o)
+                return self._send(404, {"code": "NOT_FOUND", "message": "no such order"})
             if u.path == "/v1/securities/tas":
                 after = int(q.get("after", 0))
                 rows = [{k: v for k, v in x.items() if k != "ticker"} for x in s.tas
@@ -305,8 +319,22 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/v1/orders":
             code, obj = SIM.order(q.get("ticker"), q.get("action", "").upper(),
-                                  int(float(q.get("quantity", 0))), q.get("type", "MARKET").upper())
+                                  int(float(q.get("quantity", 0))), q.get("type", "MARKET").upper(),
+                                  float(q["price"]) if "price" in q else None)
             return self._send(code, obj)
+        self._send(404, {"code": "NOT_FOUND", "message": u.path})
+
+    def do_DELETE(self):
+        if not self._auth():
+            return
+        u = urlparse(self.path)
+        if u.path.startswith("/v1/orders/"):
+            with SIM.lock:
+                for o in SIM.orders:
+                    if str(o["order_id"]) == u.path.rsplit("/", 1)[1] and o["status"] == "OPEN":
+                        o["status"] = "CANCELLED"
+                        return self._send(200, {"success": True})
+            return self._send(404, {"code": "NOT_FOUND", "message": "no open order with that id"})
         self._send(404, {"code": "NOT_FOUND", "message": u.path})
 
 

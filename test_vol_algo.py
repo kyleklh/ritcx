@@ -25,7 +25,7 @@ class TradeOptionsTest(unittest.TestCase):
         va.ST.rtm_pos = 0
         self.orders = []
         self._place = va.place
-        va.place = lambda tk, side, q: self.orders.append((tk, side, int(q))) or int(q)
+        va.place = lambda tk, side, q, limit=None: self.orders.append((tk, side, int(q))) or int(q)
 
     def tearDown(self):
         va.place = self._place
@@ -89,7 +89,7 @@ class GammaTrimTest(unittest.TestCase):
         va.ST.rtm_pos = 0
         self.orders = []
         self._place, self._max = va.place, va.GAMMA_EDGE_MAX
-        va.place = lambda tk, side, q: self.orders.append((tk, side, int(q))) or int(q)
+        va.place = lambda tk, side, q, limit=None: self.orders.append((tk, side, int(q))) or int(q)
 
     def tearDown(self):
         va.place, va.GAMMA_EDGE_MAX = self._place, self._max
@@ -139,7 +139,7 @@ class StrikeArbTest(unittest.TestCase):
     def tearDown(self):
         va.place = self._place
 
-    def fake_place(self, tk, side, q):
+    def fake_place(self, tk, side, q, limit=None):
         self.orders.append((tk, side, int(q)))
         return int(q)
 

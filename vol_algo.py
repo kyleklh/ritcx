@@ -149,14 +149,25 @@ def api_get(path, **params):
     return None
 
 
-def place(ticker, action, qty):
+LIMIT_ORDERS = os.environ.get("LIMIT_ORDERS", "1") == "1"   # option trades on an edge go as limit orders at the
+                              # price the algo saw. A burst of market orders that runs past the end of a tick fills at
+                              # the NEXT tick's quotes: test 19 (20 Nov) lost $56k that way, every bad fill at exactly
+                              # the next tick's price. Hedges and risk cuts stay market orders. LIMIT_ORDERS=0: off.
+
+
+def place(ticker, action, qty, limit=None):
+    """Market order, or (limit given and LIMIT_ORDERS) a limit order at that price whose unfilled rest is cancelled
+    at once, so it can only fill at the price the decision was made on."""
     qty = int(qty)
     if qty <= 0:
         return 0
+    use_limit = limit is not None and LIMIT_ORDERS
+    params = {"ticker": ticker, "type": "LIMIT" if use_limit else "MARKET", "quantity": qty, "action": action}
+    if use_limit:
+        params["price"] = round(limit, 2)
     for _ in range(5):
         try:
-            r = s.post(f"{API}/orders", params={"ticker": ticker, "type": "MARKET",
-                                                "quantity": qty, "action": action}, timeout=2)
+            r = s.post(f"{API}/orders", params=params, timeout=2)
             if r.status_code == 429:
                 time.sleep(float(r.json().get("wait", 0.1)))
                 continue
@@ -164,13 +175,32 @@ def place(ticker, action, qty):
                 say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120]}")
                 return 0
             j = r.json()
-            filled = int(j.get("quantity_filled", qty))
+            if use_limit:
+                j = settle_limit(j, qty)
+            filled = int(j.get("quantity_filled", 0 if use_limit else qty) or 0)
             MKT.fill(ticker, action, filled, j.get("vwap"))
             return filled
         except requests.RequestException as e:
             say(f"[warn] order failed: {e}")
             time.sleep(0.2)
     return 0
+
+
+def settle_limit(j, qty):
+    """A limit order that didn't fully fill at once: cancel the rest, then read back what actually filled."""
+    if int(j.get("quantity_filled", 0) or 0) >= qty or j.get("status") == "TRANSACTED":
+        return j
+    oid = j.get("order_id")
+    if oid is None:
+        return j
+    try:
+        s.delete(f"{API}/orders/{oid}", timeout=2)
+        r = s.get(f"{API}/orders/{oid}", timeout=2)
+        if r.ok:
+            return r.json()
+    except requests.RequestException as e:
+        say(f"[warn] limit order {oid} cancel/check failed: {e}")
+    return j
 
 
 # ------------------------------- market log (read-only) -------------------------------
@@ -470,7 +500,8 @@ def trade_options(info, tick, gcap):
                 break
             if q <= 0 or (q < MIN_OPEN_QTY and not closing):
                 break
-            filled = place(tk, side, q)
+            px = info[tk]["ask"] if side == "BUY" else info[tk]["bid"]     # the price the edge was computed on
+            filled = place(tk, side, q, limit=px)
             n_orders += 1
             if filled <= 0:
                 break
@@ -533,7 +564,7 @@ def arb_orders(info, tick, buys, sells):
         item = queues[side][0]
         tk, rem = item
         q = min(cap, rem)
-        filled = place(tk, side, q)
+        filled = place(tk, side, q, limit=info[tk]["ask"] if side == "BUY" else info[tk]["bid"])
         sgn = 1 if side == "BUY" else -1
         if filled > 0:
             traded = True
