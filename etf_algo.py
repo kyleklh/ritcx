@@ -128,6 +128,11 @@ MM_EDGE = float(os.environ.get("MM_EDGE", "0.25"))   # USD/share from fair
 MM_SIZE = 10000
 MM_MAX = 30000
 MM_REQUOTE = 0.02             # move a resting quote when the wanted price changed by this much
+# Passive hedge of MM fills (MM_PASSIVE=1): instead of crossing BULL/BEAR spreads (~0.13/pair measured), rest the
+# hedge one cent inside the best bid/ask for MM_PASSIVE_TICKS ticks (earns the 0.03 rebate), then send what's left
+# to market as before. MM_PASSIVE=0 in .env = hedge MM fills at market straight away.
+MM_PASSIVE = os.environ.get("MM_PASSIVE", "1") == "1"
+MM_PASSIVE_TICKS = int(os.environ.get("MM_PASSIVE_TICKS", "3"))
 PENDING_SHARE = 0.6           # a good tender blocked by limits: spend up to this share of its edge unwinding pairs
 PENDING_MAX_COST = 0.25       # ...but never more than this CAD/share per pair unwound (crossing 3 spreads + fees
                               # costs ~0.19 at a neutral premium; converters ~0.15 but 2 ticks per 10k block)
@@ -233,6 +238,8 @@ class State:
     mm_orders = {}        # order id -> {"side", "price", "filled"}
     mm_stats = [0, 0.0]   # shares filled, sum of (edge vs fair at fill) * shares
     mm_hedge_until = -1   # hedge an MM fill at market until this tick
+    mm_passive_until = -1 # before that: hedge it passively (limit orders inside the spread) until this tick
+    mm_hedge_log = []     # (tick, leg, side, qty, price, how) for the heat summary
     last_tender_tick = -100
 
 
@@ -721,7 +728,9 @@ def hedge(snap, tick, orders=None, passive=True):
     target = -(pos.get("RITC", 0) + ST.ritc_plan)     # RITC still going back into its own book needs no hedge
     orders = open_orders() if orders is None else orders
     did = False
-    fast = tick <= ST.fast_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS or tick <= ST.mm_hedge_until
+    tender_or_end = tick <= ST.fast_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS
+    mm_passive = MM_PASSIVE and not tender_or_end and tick <= ST.mm_passive_until
+    fast = tender_or_end or (tick <= ST.mm_hedge_until and not mm_passive)
     slip = FAST_SLIP if fast else HEDGE_SLIP
     gross = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(pos.get("RITC", 0))
     leg_room = max(0.0, (HEDGE_USAGE_MAX * snap["gross_limit"] - gross) / 2)   # gross we may add, per leg
@@ -742,6 +751,8 @@ def hedge(snap, tick, orders=None, passive=True):
             ST.gap_since.pop(leg, None)
             since = tick
         tolerance = 0 if fast or tick - since >= STALL_TICKS else URGENT_GAP
+        if mm_passive:
+            tolerance = abs(gap)          # all of it rests inside the spread for now
         urgent = abs(gap) - tolerance
         # keep the legs in step: don't let this leg get more than URGENT_GAP ahead of the other one
         other = raw_gap["BEAR" if leg == "BULL" else "BULL"]
@@ -779,6 +790,12 @@ def hedge(snap, tick, orders=None, passive=True):
     # 2) passive part: one resting order at the best bid (buy) / best ask (sell), normal mode only.
     #    Only once per tick: a resting order's fills can show in /securities late, and re-sizing
     #    it several times per tick on a stale position stacks orders and overshoots the hedge.
+    if MM_PASSIVE and ST.mm_passive_until >= 0 and tick == ST.mm_passive_until + 1 and passive:
+        left = max((abs(P["gap"]) for P in plan.values()), default=0)
+        if left >= HEDGE_MIN:
+            event(tick, "MM", f"passive hedge window over: {left:,.0f} still open -> market")
+        else:
+            event(tick, "MM", "passive hedge filled inside the spread")
     for leg, P in plan.items():
         mine, gap, side = P["mine"], P["gap"], P["side"]
         if fast:
@@ -790,6 +807,13 @@ def hedge(snap, tick, orders=None, passive=True):
         want_qty = abs(gap) if abs(gap) >= HEDGE_MIN else 0
         bid, ask = q[leg]
         want_px = bid if side == "BUY" else ask
+        if mm_passive and bk[leg]["bids"] and bk[leg]["asks"]:
+            # one cent inside the OTHER traders' best (the books exclude our own orders, so we never chase ourselves)
+            ob, oa = bk[leg]["bids"][0][0], bk[leg]["asks"][0][0]
+            if oa - ob > 0.025:
+                want_px = round(ob + 0.01, 2) if side == "BUY" else round(oa - 0.01, 2)
+            else:
+                want_px = ob if side == "BUY" else oa
         resting = sum(o["quantity"] - o.get("quantity_filled", 0) for o in mine)
         ok = (want_qty == 0 and not mine) or (
             mine and all(o["action"] == side and abs(o["price"] - want_px) < 1e-6 for o in mine)
@@ -960,7 +984,11 @@ def mm(snap, tick, orders):
         new = filled - info["filled"]
         if new > 0 and fair:
             e = (fair - info["price"]) if info["side"] == "BUY" else (info["price"] - fair)
-            ST.mm_hedge_until = tick + 3
+            if MM_PASSIVE:
+                ST.mm_passive_until = tick + MM_PASSIVE_TICKS
+                ST.mm_hedge_until = tick + MM_PASSIVE_TICKS + 3
+            else:
+                ST.mm_hedge_until = tick + 3
             ST.mm_stats[0] += new
             ST.mm_stats[1] += new * e * u
             event(tick, "MM", f"filled {info['side'].lower()} {new:,.0f} RITC @ {info['price']:.2f} "
@@ -1198,7 +1226,7 @@ def main():
             ST.leased = False
             ST.pending = None
             ST.arb_real, ST.arb_extra = [], 0.0
-            ST.mm_orders, ST.mm_stats, ST.mm_hedge_until = {}, [0, 0.0], -1
+            ST.mm_orders, ST.mm_stats, ST.mm_hedge_until, ST.mm_passive_until = {}, [0, 0.0], -1, -1
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
