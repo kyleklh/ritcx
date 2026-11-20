@@ -182,6 +182,14 @@ Batch test, 6 heats at 5x speed:
    `CONVERTER API NOT AVAILABLE` and switches to `>>> CONVERTER ... NOW` prompts for you to click.
    To always click yourself: `$env:AUTO_CONVERT="0"; python etf_algo.py`.
 
+9. **Patient tender mode** (`TENDER_MODE=patient` in `.env`, off by default): take a tender only if its price beats
+   BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.10 CAD/sh), then sell it back into the RITC book
+   at most `PATIENT_PER_TICK` (5,000) a tick at the best price, instead of hedging it all at once with BULL+BEAR
+   (which costs 0.2-0.4/sh on the real books). If RITC moves `PATIENT_STOP` (0.20 USD) past the tender price against
+   us, or after `PATIENT_TICKS` (40), the rest is hedged with BULL+BEAR at market. Market making and arb pause while
+   a tender is being worked. Replay of 10 real heats (Nov 20), one tender at a time: about +18k/heat from tenders,
+   9 of 10 heats positive, worst about 0. Log lines: `PATIENT | done ...`, `PATIENT | stop-loss ...`.
+
 ### Operator during the heat
 
 - The algo converts by itself. If you see `CONVERTER API NOT AVAILABLE`, click Use on the converter named in each
