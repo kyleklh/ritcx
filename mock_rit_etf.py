@@ -34,7 +34,15 @@ from urllib.parse import urlparse, parse_qs
 
 EQUITIES = ["BULL", "BEAR", "RITC"]
 TICKERS = ["CAD", "USD", "BULL", "BEAR", "RITC"]
-FEE_MKT, REBATE_LMT = 0.02, 0.01
+FEE_MKT, REBATE_LMT = 0.02, 0.03     # case info sheet: fee 0.02, limit order rebate 0.03
+
+# --real: tender prices drawn from the 62 tenders logged on the real server (Nov 16 competition heats + 4 solo
+# practices): tender price vs the BULL+BEAR mid when it arrived, CAD/share, + = good for whoever takes it.
+REAL_TENDER_EDGES = [0.127, 0.263, 0.009, 0.254, 0.206, 0.283, -0.115, 0.240, 0.068, 0.005, 0.153, 0.129, -0.066,
+                     -0.069, 0.048, 0.104, 0.455, 0.394, 0.289, -0.293, 0.358, -0.051, -0.045, 0.284, -0.017, -0.101,
+                     0.048, 0.081, 0.078, 0.253, 0.256, -0.216, -0.023, 0.014, 0.158, 0.728, 0.495, 0.089, 0.151,
+                     -0.086, 0.037, 0.140, 0.158, 0.132, 0.170, -0.038, 0.008, -0.006, 0.361, -0.021, 0.009, 0.143,
+                     -0.139, 0.346, 0.415, 0.117, 0.340, 0.388, 0.214, 0.382, 0.138, 0.394]
 MAX_ORDER = {"BULL": 10000, "BEAR": 10000, "RITC": 10000, "USD": 2_500_000, "CAD": 2_500_000}
 CONVERT_COST_USD = 1500.0
 
@@ -42,7 +50,7 @@ CONVERT_COST_USD = 1500.0
 class Sim:
     def __init__(self, seed, ticks=300, gross_limit=300_000, net_limit=200_000,
                  depth_mult=1.0, vol_mult=1.0, flow_mult=1.0, gift_mean=0.10, shock_mult=1.0,
-                 tender_min=70_000, tender_max=100_000, pos_lag=0.0, crowd=0, crowd_impact=1.0):
+                 tender_min=70_000, tender_max=100_000, pos_lag=0.0, crowd=0, crowd_impact=1.0, real=False):
         self.rng = random.Random(seed)
         r = self.rng
         self.ticks = ticks
@@ -61,6 +69,13 @@ class Sim:
         self.level_step = {"BULL": 0.01, "BEAR": 0.01, "RITC": 0.01, "USD": 0.0001}
         self.depth = {"BULL": r.choice([2000, 3000, 4000]), "BEAR": r.choice([2000, 3000, 4000]),
                       "RITC": r.choice([1000, 1500, 2000]), "USD": 1_000_000}
+        self.real = real
+        if real:
+            # measured on the real books (median over 2 sessions): ~9.5k per level, steps 0.02/0.025/0.035,
+            # spreads 0.065/0.075/0.11 for BULL/BEAR/RITC
+            self.half_spread.update({"BULL": 0.03, "BEAR": 0.04, "RITC": 0.05})
+            self.level_step.update({"BULL": 0.02, "BEAR": 0.025, "RITC": 0.035})
+            self.depth.update({t: r.choice([8500, 9500, 10500]) for t in ("BULL", "BEAR", "RITC")})
         self.disp = {t: 0.0 for t in ["BULL", "BEAR", "RITC", "USD"]}   # temporary price impact
         self.depth = {k: max(100, int(v * depth_mult)) for k, v in self.depth.items()}
         self.flow = {k: int(v * flow_mult) for k, v in {"BULL": 3000, "BEAR": 3000, "RITC": 2000, "USD": 500_000}.items()}
@@ -70,7 +85,7 @@ class Sim:
         self.orders = []
         self.open_orders = {}
         self.tenders = []
-        self.next_tender_tick = r.randint(5, 15)
+        self.next_tender_tick = r.randint(15, 28) if real else r.randint(5, 15)
         self.tender_id = 0
         self.tender_log = []
         self.tender_min, self.tender_max = tender_min, tender_max
@@ -236,16 +251,20 @@ class Sim:
         r = self.rng
         self.tenders = [x for x in self.tenders if x["expires"] > self.tick]
         if self.tick >= self.next_tender_tick and self.tick < self.ticks - 15:
-            self.next_tender_tick = self.tick + r.randint(15, 30)
+            self.next_tender_tick = self.tick + (r.randint(22, 40) if self.real else r.randint(15, 30))
             self.tender_id += 1
             action = r.choice(["BUY", "SELL"])
             qty = r.randrange(self.tender_min, self.tender_max + 1, 1000)   # real server: 72k-98k
             fair = self.ritc_fair()
             # positive = good for us; sometimes a trap
-            gift = r.gauss(self.gift_mean, 0.10)
-            fixed = r.random() < 0.75
+            if self.real:      # real tenders: drawn from the logged ones, all fixed-price, 6 ticks to answer
+                gift = r.choice(REAL_TENDER_EDGES) / self.F["USD"] + r.gauss(0, 0.02)
+                fixed = True
+            else:
+                gift = r.gauss(self.gift_mean, 0.10)
+                fixed = r.random() < 0.75
             px = round(fair - gift if action == "BUY" else fair + gift, 2)
-            tdr = {"tender_id": self.tender_id, "period": 1, "tick": self.tick, "expires": self.tick + 12,
+            tdr = {"tender_id": self.tender_id, "period": 1, "tick": self.tick, "expires": self.tick + (6 if self.real else 12),
                    "caption": f"Institution wants you to {action} {qty} RITC", "quantity": qty,
                    "ticker": "RITC", "action": action, "is_fixed_bid": fixed,
                    "price": px if fixed else None}
@@ -496,6 +515,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, [{k: v for k, v in x.items() if not k.startswith("_")} for x in s.tenders])
             if path == "/v1/limits":
                 return self._send(200, s.limits())
+            if path.startswith("/v1/orders/"):
+                oid = int(path.rsplit("/", 1)[1])
+                for o in s.orders:
+                    if o.get("order_id") == oid:
+                        return self._send(200, o)
+                return self._send(404, {"code": "NOT_FOUND", "message": "no such order"})
             if path == "/v1/orders":
                 st = q.get("status", "OPEN")
                 return self._send(200, [o for o in s.orders if o["status"] == st])
@@ -546,7 +571,7 @@ def run_clock(args):
         SIM = Sim(seed, gross_limit=args.gross, net_limit=args.net, depth_mult=args.depth_mult,
                   vol_mult=args.vol_mult, flow_mult=args.flow_mult, gift_mean=args.gift_mean, shock_mult=args.shock_mult,
                   tender_min=args.tender_min, tender_max=args.tender_max, pos_lag=args.pos_lag,
-                  crowd=args.crowd, crowd_impact=args.crowd_impact)
+                  crowd=args.crowd, crowd_impact=args.crowd_impact, real=args.real)
         print(f"[mock] new heat, seed={seed}", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -577,6 +602,10 @@ def main():
     p.add_argument("--crowd", type=int, default=0, help="number of competing teams taking and hedging the same tenders")
     p.add_argument("--crowd-impact", type=float, default=1.0, help="how hard their hedging moves prices")
     p.add_argument("--loop", action="store_true")
+    p.add_argument("--real", action="store_true",
+                   help="closer to the real server: real book depth/spreads, tender prices drawn from the 62 logged "
+                        "real tenders, all fixed-price, 6 ticks to answer. Still NOT for judging P&L: the book refills "
+                        "instantly after every trade, so it scores the Nov 16 algo ~+55-80k/heat vs ~+6k for real")
     args = p.parse_args()
     global SIM
     SIM = Sim(args.seed, gross_limit=args.gross, net_limit=args.net)
