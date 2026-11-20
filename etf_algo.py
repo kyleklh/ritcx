@@ -1019,6 +1019,15 @@ def converters(snap, tick):
             need = max(need, math.ceil(p_need / CONVERT_BLOCK))
     if need == 0:
         return
+    # Hedge first: a conversion locks the ETF tickers for ~3 ticks. While the hedge can still trade inside the
+    # limits, let it (practice heat: 3 back-to-back conversions left an 85k tender ~60k unhedged for 10 ticks: -55k).
+    pe = effective_pos(snap)
+    tgt = -(pe.get("RITC", 0) + ST.ritc_plan)
+    gap = max(abs(tgt - pe.get(l, 0)) for l in ("BULL", "BEAR"))
+    gross_now = abs(pe.get("BULL", 0)) + abs(pe.get("BEAR", 0)) + 2 * abs(pe.get("RITC", 0))
+    leg_room = max(0.0, (HEDGE_USAGE_MAX * gl - gross_now) / 2)
+    if gap >= HEDGE_MIN and leg_room >= min(gap, CONVERT_BLOCK):
+        return
     sgn = 1 if r > 0 else -1
     hedged = min(abs(r), max(0.0, -sgn * pos.get("BULL", 0)), max(0.0, -sgn * pos.get("BEAR", 0)))
     if hedged < CONVERT_BLOCK:
