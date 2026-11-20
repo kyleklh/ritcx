@@ -468,8 +468,8 @@ def quick_hedge(tick, d):
 def trade_options(info, tick, gcap):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
-    net = sum(o["pos"] for o in info.values())
-    gross = sum(abs(o["pos_total"]) for o in info.values())   # the gross limit counts the strike engine too
+    net = sum(o["pos_total"] for o in info.values())          # total net: the engine's legs count too, so
+    gross = sum(abs(o["pos_total"]) for o in info.values())   # the main book leaves it room to unwind   # the gross limit counts the strike engine too
     # candidate trades ranked by $ edge per contract
     # Rank by edge, but trades that CLOSE an existing position go first: when the view flips,
     # buying back old shorts beats opening offsetting longs at a nearby strike (saves fees + limit room).
@@ -568,7 +568,7 @@ def straddle(info, k, n):
     return {CALLS[k]: nc, PUTS[k]: n - nc}
 
 
-def arb_orders(info, tick, buys, sells):
+def arb_orders(info, tick, buys, sells, entry=False):
     """Trade two baskets in two waves of 100-lots sent at the same time: first every clip on the side that moves
     net toward zero, then the other side, capped at what the first wave filled. Net never goes beyond where it
     started (the main book may be at the net limit), and a pair takes 2 round trips instead of 14+."""
@@ -577,6 +577,7 @@ def arb_orders(info, tick, buys, sells):
     baskets = {"BUY": buys, "SELL": sells}
     traded = False
     buffer = 0
+    done = {"BUY": {}, "SELL": {}}
     for side in (good, "BUY" if good == "SELL" else "SELL"):
         cap = None if side == good or not any(n > 0 for n in baskets[good].values()) else buffer
         clips = []
@@ -596,8 +597,28 @@ def arb_orders(info, tick, buys, sells):
                 ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
                 info[tk]["pos_total"] += sgn * filled
                 ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
+                done[side][tk] = done[side].get(tk, 0) + filled
                 if side == good:
                     buffer += filled
+    bad = "BUY" if good == "SELL" else "SELL"
+    excess = sum(done[good].values()) - sum(done[bad].values())
+    if entry and excess > 0:
+        # second leg came up short (limit orders that missed): take back the unmatched part of the first leg at
+        # market, so the engine never holds a lopsided pair it may not be able to unwind at the net limit
+        back = "BUY" if good == "SELL" else "SELL"
+        sgn = 1 if back == "BUY" else -1
+        clips = []
+        for tk, n in sorted(done[good].items(), key=lambda kv: -kv[1]):
+            while n > 0 and excess > 0:
+                q = min(CLIP, n, excess)
+                clips.append((tk, back, q, None))
+                n -= q
+                excess -= q
+        for (tk, _, q, _), filled in zip(clips, place_many(clips)):
+            if filled > 0:
+                ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
+                info[tk]["pos_total"] += sgn * filled
+                ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
     if abs(ST.run_delta) > HEDGE_TRIGGER:                # one hedge for the whole basket
         ST.run_delta = quick_hedge(tick, ST.run_delta)
     return traded
@@ -624,7 +645,13 @@ def arb_step(info, tick, S, T):
             if not any(ST.arb_pos.values()):
                 ST.arb = None
             else:
-                return traded                            # something didn't fill: finish unwinding next loop
+                a["fails"] = a.get("fails", 0) + 1
+                if a["fails"] < 3:
+                    return traded                        # something didn't fill: try again next loop
+                left = ", ".join(f"{tk}:{n:+d}" for tk, n in ST.arb_pos.items() if n)
+                event(tick, "ARB", f"could not unwind {left}; the main book takes them over")
+                ST.arb_pos = {}
+                ST.arb = None
     if ST.arb or ST.paused or tick >= ST.ticks - ARB_LAST_ENTRY or len(ivs) < 2:
         return traded
     lk, sk = min(ivs, key=ivs.get), max(ivs, key=ivs.get)
@@ -637,7 +664,9 @@ def arb_step(info, tick, S, T):
     if n < CLIP:
         return traded
     buys, sells = straddle(info, lk, n), straddle(info, sk, n)
-    traded = arb_orders(info, tick, buys, sells) or traded
+    traded = arb_orders(info, tick, buys, sells, entry=True) or traded
+    if not any(ST.arb_pos.values()):
+        return traded                                    # nothing (net) filled: no pair to hold
     ST.arb = {"long_k": lk, "short_k": sk, "t0": tick}
     event(tick, "ARB", f"in: buy {lk} straddle, sell {sk} straddle, {n} each; gap {gap:.1f} pts "
                        f"(${gap * vega:,.0f}/contract)")

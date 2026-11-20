@@ -197,5 +197,70 @@ class StrikeArbTest(unittest.TestCase):
         self.assertFalse(any(va.ST.arb_pos.values()))
         self.assertEqual(self.net_of(), 0)
 
+
+class EngineStuckTest(unittest.TestCase):
+    """Heat 20261120_123405: a pair went in lopsided (limit buys missed), the main book filled the net limit,
+    and the engine retried its unwind every loop for 80+ ticks."""
+    S, T = 50.0, 0.06
+
+    def setUp(self):
+        va.ST.reset()
+        va.ST.run_delta = 0
+        va.ST.rtm_pos = 0
+        self.orders = []
+        self._place = va.place
+
+    def tearDown(self):
+        va.place = self._place
+
+    def info(self, ivs):
+        sec = {}
+        for k in va.STRIKES:
+            for f, tk in (("c", va.CALLS[k]), ("p", va.PUTS[k])):
+                px = va.bs.price(f, self.S, k, self.T, ivs.get(k, 0.25))
+                sec[tk] = {"bid": round(px - 0.01, 2), "ask": round(px + 0.01, 2), "position": 0}
+        return va.option_info(sec, self.S, self.T, 0.25)
+
+    def test_lopsided_entry_is_evened_up(self):
+        def place(tk, side, q, limit=None):
+            self.orders.append((tk, side, q, limit))
+            return 0 if (tk != "RTM" and side == "BUY" and limit is not None) else int(q)   # limit buys all miss
+        va.place = place
+        va.arb_step(self.info({49: 0.20, 51: 0.30}), 10, self.S, self.T)
+        self.assertEqual(sum(va.ST.arb_pos.values()), 0)                  # never lopsided
+        self.assertFalse(any(va.ST.arb_pos.values()))                     # sold legs were bought back
+        self.assertIsNone(va.ST.arb)
+
+    def test_stuck_unwind_hands_over_after_three_tries(self):
+        rejected = []
+        def place(tk, side, q, limit=None):
+            if tk != "RTM" and side == "BUY":
+                rejected.append(tk)
+                return 0                                                  # every buy hits the net limit
+            return int(q)
+        va.place = place
+        va.ST.arb_pos = {"RTM50C": -300, "RTM50P": -400, "RTM48C": 100, "RTM48P": 169}
+        va.ST.arb = {"long_k": 48, "short_k": 50, "t0": 2}
+        for t in (60, 61, 62, 63, 64):
+            va.arb_step(self.info({48: 0.255, 50: 0.245}), t, self.S, self.T)
+        self.assertIsNone(va.ST.arb)
+        self.assertFalse(any(va.ST.arb_pos.values()))
+        self.assertLessEqual(len(rejected), 3 * 8)                        # three tries, then it stops
+
+    def test_main_book_counts_engine_legs(self):
+        bought = []
+
+        def place(tk, side, q, limit=None):
+            if side == "BUY" and tk != "RTM":
+                bought.append(q)
+            return int(q)
+        va.place = place
+        # main book 850 (delta-neutral), engine legs net +100 -> total 950: no room left for the main book
+        info = make_info({"RTM48C": {"pos": 425, "pos_total": 425}, "RTM48P": {"pos": 425, "pos_total": 425},
+                          "RTM49C": {"pos": 0, "pos_total": 400}, "RTM51P": {"pos": 0, "pos_total": -300},
+                          "RTM50C": {"buy_edge": 0.5}})
+        va.trade_options(info, 50, gcap=1e9)
+        self.assertEqual(sum(bought), 0)
+
 if __name__ == "__main__":
     unittest.main()
