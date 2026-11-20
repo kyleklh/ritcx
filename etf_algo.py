@@ -100,9 +100,14 @@ REBATE = 0.03                 # limit order rebate per share (case info sheet)
 # ARB_BIG=0 in .env switches back to the small arb.
 ARB_BIG = os.environ.get("ARB_BIG", "1") == "1"
 ARB_OPEN_EDGE = 0.10 if ARB_BIG else 0.03   # CAD/share net of 3 fees, to OPEN / grow pairs
-ARB_CLOSE_EDGE = 0.00         # CAD/share net of fees, to CLOSE existing pairs (frees capacity)
+# Practice Nov 19 (3 heats, 75 three-leg trades): opens planned +0.116 realized +0.090; closes planned +0.041
+# realized -0.017 (a close fires right as the gap flips back, and the flip is often gone before all legs fill).
+# Replaying 11 real heats with that slippage: close at +0.06 -> +7.5k/heat vs +6.4k at 0.00 (old small arb +0.7k).
+ARB_CLOSE_EDGE = 0.06 if ARB_BIG else 0.00   # CAD/share net of fees, to CLOSE existing pairs
 ARB_CLIP = 10000 if ARB_BIG else 5000
 ARB_STEP = 1000               # sizes tried when walking the books
+HOLD_MIN_EDGE = 0.15          # only tenders this good are worth paying to make room for (practice: two HOLDs at
+                              # 0.09-0.11 cost ~2.2k of unwinding and the edge was gone 2 ticks later)
 PENDING_SHARE = 0.6           # a good tender blocked by limits: spend up to this share of its edge unwinding pairs
 PENDING_MAX_COST = 0.25       # ...but never more than this CAD/share per pair unwound (crossing 3 spreads + fees
                               # costs ~0.19 at a neutral premium; converters ~0.15 but 2 ticks per 10k block)
@@ -635,7 +640,7 @@ def handle_tenders(snap, tick):
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
         if (why.startswith("limits") and t.get("is_fixed_bid", True) and not ST.pending
-                and edge >= TENDER_MIN_EDGE and edge * q >= TENDER_MIN_PROFIT
+                and edge >= max(TENDER_MIN_EDGE, HOLD_MIN_EDGE) and edge * q >= TENDER_MIN_PROFIT
                 and snap.get("ticks", 300) - tick >= TENDER_CUTOFF_TICKS
                 and tick < int(t.get("expires", tick + 6)) - 1):
             ST.pending = {"t": t, "deadline": int(t.get("expires", tick + 6)) - 1}
