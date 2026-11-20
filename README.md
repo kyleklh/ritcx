@@ -140,6 +140,13 @@ Batch test, 6 heats at 5x speed:
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
+13. **Market making in RITC** (`MM_ON=1`, default; `MM_ON=0` in `.env` turns it off; `MM_EDGE` sets the distance):
+   a resting RITC bid at fair-0.25 USD and ask at fair+0.25 (fair = (BULL+BEAR)/USD), 10k each, up to 30k RITC.
+   RITC swings +-0.17 around fair every few ticks and snaps back, so the quotes get filled at the extremes for free
+   (+0.03 rebate); each fill is hedged with BULL+BEAR at market. team08 does this in practice. Replaying 27 real
+   heats' books (fill only if the bots' price moves 0.02 through ours, 0.03-0.05 hedge slippage): +13-19k/heat,
+   24-27 of 27 heats positive. Real fill rates are the unknown: the log prints every `MM | filled` line with its
+   edge vs fair. Quotes are pulled while a tender is being hedged/held, during conversions, and in the last 30 ticks.
 12. **Big arb** (`ARB_BIG=1`, default; `ARB_BIG=0` in `.env` = old small arb): RITC vs BULL+BEAR gaps above
    0.05/sh after fees appear on ~13% of ticks and close within 2-3 ticks. Up to 60k pairs, 10k per trade, opens at
    0.10/sh, all three legs at market at once, sized by walking the visible books. Replaying the 8 real heats' books:

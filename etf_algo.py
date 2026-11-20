@@ -117,6 +117,17 @@ ARB_GUARD_STEP = 0.05
 ARB_GUARD_MAX = 0.30
 HOLD_MIN_EDGE = 0.15          # only tenders this good are worth paying to make room for (practice: two HOLDs at
                               # 0.09-0.11 cost ~2.2k of unwinding and the edge was gone 2 ticks later)
+# Market making in RITC (MM_ON=1, default): resting bid at fair-MM_EDGE and ask at fair+MM_EDGE (fair = basket/USD),
+# MM_SIZE each, while |RITC| < MM_MAX. A fill is hedged with BULL+BEAR at market right away. RITC swings +-0.17 around
+# fair every few ticks and snaps back: resting orders get filled at the extremes for free (+0.03 rebate) instead of
+# paying ~0.19 to cross three spreads. team08 does this in practice (bids ~-0.17, asks ~+0.17 vs fair). Replaying 27
+# real heats' books with fills only when the bots' price moves 0.02 through ours and 0.03-0.05/sh hedge slippage:
+# +-0.25 -> +13-19k/heat, 24-27 of 27 heats positive. Fill rates are the uncertain part: watch the MM lines.
+MM_ON = os.environ.get("MM_ON", "1") == "1"
+MM_EDGE = float(os.environ.get("MM_EDGE", "0.25"))   # USD/share from fair
+MM_SIZE = 10000
+MM_MAX = 30000
+MM_REQUOTE = 0.02             # move a resting quote when the wanted price changed by this much
 PENDING_SHARE = 0.6           # a good tender blocked by limits: spend up to this share of its edge unwinding pairs
 PENDING_MAX_COST = 0.25       # ...but never more than this CAD/share per pair unwound (crossing 3 spreads + fees
                               # costs ~0.19 at a neutral premium; converters ~0.15 but 2 ticks per 10k block)
@@ -218,6 +229,10 @@ class State:
     last_vwap = {}        # ticker -> vwap of our last market order
     arb_real = []         # realized edges of recent opening trades
     arb_extra = 0.0       # extra edge demanded by the self-check
+    my_id = "self"        # our trader id (books show it on our own resting orders)
+    mm_orders = {}        # order id -> {"side", "price", "filled"}
+    mm_stats = [0, 0.0]   # shares filled, sum of (edge vs fair at fill) * shares
+    mm_hedge_until = -1   # hedge an MM fill at market until this tick
     last_tender_tick = -100
 
 
@@ -313,9 +328,9 @@ def snapshot():
             return None
         raw_books[t] = b
         books[t] = {"bids": [(float(l["price"]), int(l["quantity"]) - int(l.get("quantity_filled", 0)))
-                             for l in b["bids"] if l.get("trader_id") != "self"],
+                             for l in b["bids"] if l.get("trader_id") not in ("self", ST.my_id)],
                     "asks": [(float(l["price"]), int(l["quantity"]) - int(l.get("quantity_filled", 0)))
-                             for l in b["asks"] if l.get("trader_id") != "self"]}
+                             for l in b["asks"] if l.get("trader_id") not in ("self", ST.my_id)]}
     lim = get("/limits")
     if lim:
         L = lim[0]
@@ -706,7 +721,7 @@ def hedge(snap, tick, orders=None, passive=True):
     target = -(pos.get("RITC", 0) + ST.ritc_plan)     # RITC still going back into its own book needs no hedge
     orders = open_orders() if orders is None else orders
     did = False
-    fast = tick <= ST.fast_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS
+    fast = tick <= ST.fast_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS or tick <= ST.mm_hedge_until
     slip = FAST_SLIP if fast else HEDGE_SLIP
     gross = abs(pos.get("BULL", 0)) + abs(pos.get("BEAR", 0)) + 2 * abs(pos.get("RITC", 0))
     leg_room = max(0.0, (HEDGE_USAGE_MAX * snap["gross_limit"] - gross) / 2)   # gross we may add, per leg
@@ -916,6 +931,79 @@ def arb(snap, tick):
     return False
 
 
+# ------------------------------- 3b. market making in RITC -------------------------------
+def mm_cancel_all():
+    for oid in list(ST.mm_orders):
+        _req("DELETE", f"/orders/{oid}")
+    ST.mm_orders = {}
+
+
+def mm(snap, tick, orders):
+    """Keep one resting RITC bid at fair-MM_EDGE and one ask at fair+MM_EDGE (USD); log fills."""
+    if not MM_ON:
+        return
+    q = snap["q"]
+    mine = {o["order_id"]: o for o in orders if o.get("ticker") == "RITC" and o.get("type", "LIMIT") == "LIMIT"}
+    # fills since last look (orders that vanished were filled or cancelled; check the filled amount when we can)
+    u = sum(q["USD"]) / 2 if quotes_ok(q) else 1.0
+    fair = (sum(q["BULL"]) / 2 + sum(q["BEAR"]) / 2) / u if quotes_ok(q) else None
+    for oid, info in list(ST.mm_orders.items()):
+        o = mine.get(oid)
+        filled = (o.get("quantity_filled", 0) if o else info["qty"] - info.get("cancelled", 0))
+        if o is None and not info.get("cancelled"):
+            r = _req("GET", f"/orders/{oid}")
+            if r is not None and r.ok:
+                try:
+                    filled = r.json().get("quantity_filled", filled)
+                except ValueError:
+                    pass
+        new = filled - info["filled"]
+        if new > 0 and fair:
+            e = (fair - info["price"]) if info["side"] == "BUY" else (info["price"] - fair)
+            ST.mm_hedge_until = tick + 3
+            ST.mm_stats[0] += new
+            ST.mm_stats[1] += new * e * u
+            event(tick, "MM", f"filled {info['side'].lower()} {new:,.0f} RITC @ {info['price']:.2f} "
+                              f"({e:+.3f} USD vs fair)  | heat total {ST.mm_stats[0]:,.0f} sh, "
+                              f"avg {ST.mm_stats[1] / ST.mm_stats[0]:+.3f} CAD/sh before hedge")
+        info["filled"] = filled
+        if o is None:
+            del ST.mm_orders[oid]
+    ticks_left = snap.get("ticks", 300) - tick
+    pos = effective_pos(snap)
+    r = pos.get("RITC", 0)
+    gap = max(abs(pos.get(l, 0) + r) for l in ("BULL", "BEAR"))
+    stop = (fair is None or ST.paused or ST.pending or tick <= ST.fast_until or ticks_left <= NO_OPEN_TICKS
+            or gap > URGENT_GAP or snap["tick"] < ST.conv_hold_until)
+    if stop:
+        if ST.mm_orders:
+            mm_cancel_all()
+        return
+    gl, nl = snap["gross_limit"], snap["net_limit"]
+    want = {}
+    if r < MM_MAX and usage(pos, gl, nl, d_ritc=MM_SIZE, d_bull=-MM_SIZE, d_bear=-MM_SIZE) <= LIMIT_USAGE_MAX:
+        want["BUY"] = (math.floor((fair - MM_EDGE) * 100) / 100, int(min(MM_SIZE, MM_MAX - r)))
+    if r > -MM_MAX and usage(pos, gl, nl, d_ritc=-MM_SIZE, d_bull=MM_SIZE, d_bear=MM_SIZE) <= LIMIT_USAGE_MAX:
+        want["SELL"] = (math.ceil((fair + MM_EDGE) * 100) / 100, int(min(MM_SIZE, MM_MAX + r)))
+    have = {info["side"]: (oid, info) for oid, info in ST.mm_orders.items()}
+    for side in ("BUY", "SELL"):
+        cur = have.get(side)
+        w = want.get(side)
+        if cur and (not w or abs(cur[1]["price"] - w[0]) >= MM_REQUOTE - 1e-9):
+            _req("DELETE", f"/orders/{cur[0]}")
+            ST.mm_orders[cur[0]]["cancelled"] = cur[1]["qty"] - cur[1]["filled"]
+            cur = None
+        if w and not cur and w[1] >= 100:
+            resp = _req("POST", "/orders", ticker="RITC", type="LIMIT", quantity=w[1], action=side, price=f"{w[0]:.2f}")
+            if resp is not None and resp.ok:
+                try:
+                    oid = resp.json().get("order_id")
+                except ValueError:
+                    oid = None
+                if oid is not None:
+                    ST.mm_orders[oid] = {"side": side, "price": w[0], "qty": w[1], "filled": 0}
+
+
 # ------------------------------- 4. FX -------------------------------
 def fx_hedge(snap):
     if busy("USD", "RITC"):
@@ -1089,6 +1177,9 @@ def main():
     log = csv.writer(logf)
     log.writerow(["tick", "BULL", "BEAR", "RITC", "USD", "usage", "nlv"])
     last_print = -1
+    me = get("/trader") or {}
+    ST.my_id = me.get("trader_id") or "self"
+    say(f"[trader id] {ST.my_id}  | market making {'ON' if MM_ON else 'off'} (+-{MM_EDGE:.2f} USD, max {MM_MAX:,})")
     while not ST.quit:
         case = get("/case")
         if not case or case.get("status") != "ACTIVE":
@@ -1107,6 +1198,7 @@ def main():
             ST.leased = False
             ST.pending = None
             ST.arb_real, ST.arb_extra = [], 0.0
+            ST.mm_orders, ST.mm_stats, ST.mm_hedge_until = {}, [0, 0.0], -1
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -1136,6 +1228,7 @@ def main():
         if arb(snap, tick):
             hedge(snap, tick, passive=False)
         if first_of_tick:
+            mm(snap, tick, open_orders())
             fx_hedge(snap)
 
         if tick != last_print:
@@ -1171,6 +1264,7 @@ def main():
             ST.last_slow_warn = tick
             event(tick, "SLOW !!", f"one loop took {took:.1f}s (should be <0.5s). API is slow: check the connection")
         time.sleep(LOOP_SLEEP)
+    mm_cancel_all()
     logf.close()
     say("Stopped.")
 

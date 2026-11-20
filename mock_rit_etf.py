@@ -515,6 +515,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, [{k: v for k, v in x.items() if not k.startswith("_")} for x in s.tenders])
             if path == "/v1/limits":
                 return self._send(200, s.limits())
+            if path.startswith("/v1/orders/"):
+                oid = int(path.rsplit("/", 1)[1])
+                for o in s.orders:
+                    if o.get("order_id") == oid:
+                        return self._send(200, o)
+                return self._send(404, {"code": "NOT_FOUND", "message": "no such order"})
             if path == "/v1/orders":
                 st = q.get("status", "OPEN")
                 return self._send(200, [o for o in s.orders if o["status"] == st])
