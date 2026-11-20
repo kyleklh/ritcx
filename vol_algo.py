@@ -28,6 +28,7 @@ import time
 from datetime import datetime
 
 import requests
+from concurrent.futures import ThreadPoolExecutor
 
 import bs
 from display import say, event, banner
@@ -155,6 +156,32 @@ LIMIT_ORDERS = os.environ.get("LIMIT_ORDERS", "1") == "1"   # option trades on a
                               # the next tick's price. Hedges and risk cuts stay market orders. LIMIT_ORDERS=0: off.
 
 
+PARALLEL_ORDERS = os.environ.get("PARALLEL_ORDERS", "1") == "1"   # send a basket's orders at the same time instead
+                              # of one after another: a 700-lot pair is 14+ orders (max 100 each), which one at a time
+                              # can take most of a tick, so later orders land on the next tick's prices.
+_POOL = ThreadPoolExecutor(max_workers=16)
+_TLS = threading.local()
+
+
+def _sess():
+    """One HTTP session per thread (requests sessions are not safe to share across threads)."""
+    if threading.current_thread() is threading.main_thread():
+        return s
+    if not hasattr(_TLS, "s"):
+        _TLS.s = requests.Session()
+        _TLS.s.headers.update({"X-API-Key": API_KEY})
+    return _TLS.s
+
+
+def place_many(orders):
+    """[(ticker, action, qty, limit)] -> filled quantities, all sent at once when PARALLEL_ORDERS."""
+    if not orders:
+        return []
+    if not PARALLEL_ORDERS or len(orders) == 1:
+        return [place(*o) for o in orders]
+    return list(_POOL.map(lambda o: place(*o), orders))
+
+
 def place(ticker, action, qty, limit=None):
     """Market order, or (limit given and LIMIT_ORDERS) a limit order at that price whose unfilled rest is cancelled
     at once, so it can only fill at the price the decision was made on."""
@@ -167,7 +194,7 @@ def place(ticker, action, qty, limit=None):
         params["price"] = round(limit, 2)
     for _ in range(5):
         try:
-            r = s.post(f"{API}/orders", params=params, timeout=2)
+            r = _sess().post(f"{API}/orders", params=params, timeout=2)
             if r.status_code == 429:
                 time.sleep(float(r.json().get("wait", 0.1)))
                 continue
@@ -194,8 +221,8 @@ def settle_limit(j, qty):
     if oid is None:
         return j
     try:
-        s.delete(f"{API}/orders/{oid}", timeout=2)
-        r = s.get(f"{API}/orders/{oid}", timeout=2)
+        _sess().delete(f"{API}/orders/{oid}", timeout=2)
+        r = _sess().get(f"{API}/orders/{oid}", timeout=2)
         if r.ok:
             return r.json()
     except requests.RequestException as e:
@@ -428,17 +455,13 @@ def quick_hedge(tick, d):
     """Hedge immediately inside an option-trading burst so delta never sits outside the band."""
     need = int(round(HEDGE_TARGET - d))
     need = max(-RTM_LIMIT - ST.rtm_pos, min(RTM_LIMIT - ST.rtm_pos, need))
-    while abs(need) >= 1:
-        q = min(RTM_MAX_ORDER, abs(need))
-        side = "BUY" if need > 0 else "SELL"
-        filled = place("RTM", side, q)
-        if filled <= 0:
-            break
-        sg = 1 if side == "BUY" else -1
+    side = "BUY" if need > 0 else "SELL"
+    sg = 1 if side == "BUY" else -1
+    clips = [("RTM", side, min(RTM_MAX_ORDER, abs(need) - i), None) for i in range(0, abs(need), RTM_MAX_ORDER)]
+    for filled in place_many(clips):
         ST.hedge_acc += sg * filled
         ST.rtm_pos += sg * filled
         d += sg * filled
-        need -= sg * filled
     return d
 
 
@@ -546,36 +569,36 @@ def straddle(info, k, n):
 
 
 def arb_orders(info, tick, buys, sells):
-    """Trade two baskets in 100-lots so the net position never goes beyond where it started in the direction
-    away from zero (the main book may be at the net limit): trade the side that moves net toward zero first,
-    and size each opposite clip to at most the buffer built so far."""
+    """Trade two baskets in two waves of 100-lots sent at the same time: first every clip on the side that moves
+    net toward zero, then the other side, capped at what the first wave filled. Net never goes beyond where it
+    started (the main book may be at the net limit), and a pair takes 2 round trips instead of 14+."""
     net = sum(o["pos_total"] for o in info.values())
     good = "SELL" if net > 0 else "BUY"                  # side that moves net toward zero
-    bad = "BUY" if good == "SELL" else "SELL"
-    queues = {"BUY": [[tk, n] for tk, n in buys.items() if n > 0],
-              "SELL": [[tk, n] for tk, n in sells.items() if n > 0]}
-    buffer = 0                                           # contracts moved toward zero, not yet given back
+    baskets = {"BUY": buys, "SELL": sells}
     traded = False
-    while queues["BUY"] or queues["SELL"]:
-        if queues[good] and (buffer <= 0 or not queues[bad]):
-            side, cap = good, CLIP
-        else:
-            side, cap = bad, (min(CLIP, buffer) if queues[good] else CLIP)
-        item = queues[side][0]
-        tk, rem = item
-        q = min(cap, rem)
-        filled = place(tk, side, q, limit=info[tk]["ask"] if side == "BUY" else info[tk]["bid"])
+    buffer = 0
+    for side in (good, "BUY" if good == "SELL" else "SELL"):
+        cap = None if side == good or not any(n > 0 for n in baskets[good].values()) else buffer
+        clips = []
+        for tk, n in baskets[side].items():
+            while n > 0:
+                q = min(CLIP, n) if cap is None else min(CLIP, n, cap)
+                if q <= 0:
+                    break
+                clips.append((tk, side, q, info[tk]["ask"] if side == "BUY" else info[tk]["bid"]))
+                n -= q
+                if cap is not None:
+                    cap -= q
         sgn = 1 if side == "BUY" else -1
-        if filled > 0:
-            traded = True
-            ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
-            info[tk]["pos_total"] += sgn * filled
-            ST.run_delta += sgn * filled * 100 * info[tk]["delta"]   # hedged once at the end: the baskets are
-            buffer += filled if side == good else -filled            # delta-neutral, half-built ones are not
-        item[1] -= filled if filled > 0 else q          # a rejected clip is dropped, not retried
-        if item[1] <= 0:
-            queues[side].pop(0)
-    if abs(ST.run_delta) > HEDGE_TRIGGER:
+        for (tk, _, q, _), filled in zip(clips, place_many(clips)):
+            if filled > 0:
+                traded = True
+                ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
+                info[tk]["pos_total"] += sgn * filled
+                ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
+                if side == good:
+                    buffer += filled
+    if abs(ST.run_delta) > HEDGE_TRIGGER:                # one hedge for the whole basket
         ST.run_delta = quick_hedge(tick, ST.run_delta)
     return traded
 
@@ -741,16 +764,11 @@ def hedge(sec, info, tick, force=False):
     need = int(round(HEDGE_TARGET - d))
     rtm = int(sec["RTM"]["position"])
     need = max(-RTM_LIMIT - rtm, min(RTM_LIMIT - rtm, need))
-    did = 0
-    while abs(need) >= 1:
-        q = min(RTM_MAX_ORDER, abs(need))
-        side = "BUY" if need > 0 else "SELL"
-        filled = place("RTM", side, q)
-        if filled <= 0:
-            break
-        need -= filled if side == "BUY" else -filled
-        d += filled if side == "BUY" else -filled
-        did += filled if side == "BUY" else -filled
+    side = "BUY" if need > 0 else "SELL"
+    sg = 1 if side == "BUY" else -1
+    clips = [("RTM", side, min(RTM_MAX_ORDER, abs(need) - i), None) for i in range(0, abs(need), RTM_MAX_ORDER)]
+    did = sg * sum(place_many(clips))
+    d += did
     if did:
         ST.hedge_acc += did
     elif abs(d) > 7000:
