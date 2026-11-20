@@ -140,6 +140,13 @@ Batch test, 6 heats at 5x speed:
    - Building new pairs needs `ARB_OPEN_EDGE`. Closing existing pairs needs only `ARB_CLOSE_EDGE`.
    - Capped at `ARB_MAX_PAIRS`, and paused while a tender is being hedged or converted.
 4. **FX**: keeps the USD cash position near 0.
+12. **Big arb** (`ARB_BIG=1`, default; `ARB_BIG=0` in `.env` = old small arb): RITC vs BULL+BEAR gaps above
+   0.05/sh after fees appear on ~13% of ticks and close within 2-3 ticks. Up to 60k pairs, 10k per trade, opens at
+   0.10/sh, all three legs at market at once, sized by walking the visible books. Replaying the 8 real heats' books:
+   ~+12-16k/heat vs ~+2-4k for the small arb (+6k vs +1k in the competition heats with 0.03/sh extra slippage).
+   It depends on speed: acting a full tick late loses money. When a good tender doesn't fit because of these pairs,
+   the algo HOLDs it, unwinds just enough same-direction pairs (spending up to 60% of the tender's edge; converters
+   when the market is too expensive) and accepts it within its 6 ticks.
 9. **Limit room**: pairs left from a tender are unwound at up to `ROOM_UNWIND_EDGE` down to `ROOM_TARGET`; if
    they're still above `ROOM_CONVERT_ABOVE` `ROOM_CONVERT_AFTER` ticks after the tender, hedged 10k blocks are
    converted so the next tender fits (Nov 16: ~$44k of tenders declined on limits).

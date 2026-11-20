@@ -92,10 +92,21 @@ HEDGE_MIN = 100               # ignore smaller imbalances
 REBATE = 0.03                 # limit order rebate per share (case info sheet)
 
 # Arbitrage
-ARB_OPEN_EDGE = 0.03          # CAD/share net of 3 fees, to OPEN / grow pairs
+# Big arb (ARB_BIG=1, default): RITC vs BULL+BEAR gaps above 0.05/sh after fees show up on ~13% of ticks and close
+# within 2-3 ticks. Replaying the 8 real heats' books: 60k pairs, 10k clips, open at 0.10 -> ~+12-16k/heat (+6k in
+# the 4 competition heats with 0.03/sh extra slippage) vs ~+2-4k for the small arb (10k pairs, 5k clips, 0.03).
+# All three legs are traded at once, and only as much as the visible books give at the edge. The gaps last <1 tick:
+# acting a full tick late loses money in every version, so this relies on the loop being fast.
+# ARB_BIG=0 in .env switches back to the small arb.
+ARB_BIG = os.environ.get("ARB_BIG", "1") == "1"
+ARB_OPEN_EDGE = 0.10 if ARB_BIG else 0.03   # CAD/share net of 3 fees, to OPEN / grow pairs
 ARB_CLOSE_EDGE = 0.00         # CAD/share net of fees, to CLOSE existing pairs (frees capacity)
-ARB_CLIP = 5000
-ARB_MAX_PAIRS = 10000         # max |RITC| the arb module builds on its own (keeps limit room for tenders). Was 20k:
+ARB_CLIP = 10000 if ARB_BIG else 5000
+ARB_STEP = 1000               # sizes tried when walking the books
+PENDING_SHARE = 0.6           # a good tender blocked by limits: spend up to this share of its edge unwinding pairs
+PENDING_MAX_COST = 0.25       # ...but never more than this CAD/share per pair unwound (crossing 3 spreads + fees
+                              # costs ~0.19 at a neutral premium; converters ~0.15 but 2 ticks per 10k block)
+ARB_MAX_PAIRS = 60000 if ARB_BIG else 10000         # max |RITC| the arb module builds on its own (keeps limit room for tenders). Was 20k:
                               # 12.9k arb pairs + a 97k tender the same way = 102% of the net limit, so a tender worth
                               # ~+$16k was refused (practice t=75). With 10k, any tender up to 100k fits (2*110k-20k).
 ROOM_TARGET = 10000           # after a tender, unwind pairs above this |RITC| to make room for the next one...
@@ -189,6 +200,7 @@ class State:
     fast_until = -1       # tick until which the hedge runs in fast mode (just took a tender)
     route_tick = -1
     leased = False
+    pending = None        # a good tender we're making room for: {"t": tender, "deadline": tick}
     last_tender_tick = -100
 
 
@@ -553,6 +565,52 @@ def shadow_update(tick):
     ST.shadow_obs = keep
 
 
+def _accept_fixed(t, snap, tick):
+    r = _req("POST", f"/tenders/{t['tender_id']}")
+    ok = r is not None and r.ok and r.json().get("success", True)
+    if ok:
+        q, act = t["quantity"], t["action"]
+        note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
+        plan_ritc_route(act, tick)
+        ST.fast_until, ST.last_tender_tick = tick + FAST_TICKS, tick
+    return ok
+
+
+def pending_need(snap):
+    """Same-direction pairs we must remove so the pending tender fits (gross 4*pairs + 2*tender <= limit)."""
+    P = ST.pending
+    if not P:
+        return 0
+    r = effective_pos(snap).get("RITC", 0)
+    q = P["t"]["quantity"]
+    if (P["t"]["action"] == "BUY") != (r > 0):
+        return 0
+    return max(0, int(abs(r) - (LIMIT_TRANSIENT_MAX * snap["gross_limit"] - 2 * q) / 4) + 2000)
+
+
+def check_pending(snap, tick):
+    """A good tender we couldn't fit: the arb unwinds same-direction pairs; accept as soon as it fits."""
+    P = ST.pending
+    if not P:
+        return False
+    t = P["t"]
+    q, act = t["quantity"], t["action"]
+    desc = f"{act:<4} {q:>6,} RITC @ {t.get('price')}"
+    ST.last_detail = ""
+    edge, _, why = evaluate_tender(t, snap)
+    if why.startswith("ok") and not still_hedging(snap):
+        ok = _accept_fixed(t, snap, tick)
+        event(tick, "TENDER", f"ACCEPT  {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}  (after making room)"
+              + ("" if ok else "  (FAILED)"))
+        ST.pending = None
+        return ok
+    if tick >= P["deadline"] or edge < TENDER_MIN_EDGE or ST.paused:
+        _req("DELETE", f"/tenders/{t['tender_id']}")
+        event(tick, "TENDER", f"decline {desc}  edge {edge:+.3f}/sh  (could not make room in time: {why})")
+        ST.pending = None
+    return False
+
+
 def handle_tenders(snap, tick):
     tenders = get("/tenders") or []
     for t in tenders:
@@ -576,13 +634,19 @@ def handle_tenders(snap, tick):
         shadow_register(t, snap, why, edge)
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
+        if (why.startswith("limits") and t.get("is_fixed_bid", True) and not ST.pending
+                and edge >= TENDER_MIN_EDGE and edge * q >= TENDER_MIN_PROFIT
+                and snap.get("ticks", 300) - tick >= TENDER_CUTOFF_TICKS
+                and tick < int(t.get("expires", tick + 6)) - 1):
+            ST.pending = {"t": t, "deadline": int(t.get("expires", tick + 6)) - 1}
+            need = pending_need(snap)
+            ST.pending["max_cost"] = min(PENDING_MAX_COST, PENDING_SHARE * edge * q / need) if need else 0.0
+            event(tick, "TENDER", f"HOLD    {desc}  edge if it fits {edge:+.3f}/sh = ${edge * q:,.0f}: "
+                                  f"unwinding pairs to make room ({why.split(';')[0]})")
+            shadow_note(tick, t, s_edge, s_take, edge, why)
+            continue
         if why.startswith("ok"):
-            r = _req("POST", f"/tenders/{tid}")
-            ok = r is not None and r.ok and r.json().get("success", True)
-            if ok:
-                note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
-                plan_ritc_route(act, tick)
-                ST.fast_until, ST.last_tender_tick = tick + FAST_TICKS, tick
+            ok = _accept_fixed(t, snap, tick)
             event(tick, "TENDER", f"ACCEPT  {desc}  edge {edge:+.3f}/sh = ${edge * q:,.0f}  ({why[4:]})"
                   + ("" if ok else "  (FAILED)"))
             if ST.last_detail:
@@ -712,81 +776,107 @@ def hedge(snap, tick, orders=None, passive=True):
 
 
 # ------------------------------- 3. arbitrage -------------------------------
+def _vwap(levels, q):
+    got, cost = 0, 0.0
+    for px, sz in levels:
+        k = min(sz, q - got)
+        if k <= 0:
+            break
+        got += k
+        cost += k * px
+    return cost / got if got >= q else None
+
+
+def pair_edge(snap, side, qty):
+    """CAD/share after 3 fees for trading qty pairs at market, walking the visible books.
+    side -1: sell RITC / buy BULL+BEAR.  side +1: buy RITC / sell BULL+BEAR."""
+    bk, (ub, ua) = snap["books"], snap["q"]["USD"]
+    if side < 0:
+        rp, bp, ep = _vwap(bk["RITC"]["bids"], qty), _vwap(bk["BULL"]["asks"], qty), _vwap(bk["BEAR"]["asks"], qty)
+        return None if None in (rp, bp, ep) else rp * ub - bp - ep - 3 * FEE
+    rp, bp, ep = _vwap(bk["RITC"]["asks"], qty), _vwap(bk["BULL"]["bids"], qty), _vwap(bk["BEAR"]["bids"], qty)
+    return None if None in (rp, bp, ep) else bp + ep - rp * ua - 3 * FEE
+
+
+def pair_size(snap, side, thr, cap):
+    """Largest size (ARB_STEP steps, up to cap) whose average edge is still >= thr. Returns (size, edge)."""
+    best, best_e, n = 0, None, ARB_STEP
+    while n <= cap:
+        e = pair_edge(snap, side, n)
+        if e is None or e < thr:
+            break
+        best, best_e, n = n, e, n + ARB_STEP
+    return best, best_e
+
+
+def trade_pair(side, qty, pos, label, edge):
+    """All three legs at market, back to back. A leg that fills short is fixed by hedge()."""
+    f = market("RITC", "SELL" if side < 0 else "BUY", qty, pos.get("RITC", 0))
+    if not f:
+        return 0
+    pos["RITC"] = pos.get("RITC", 0) + (f if side > 0 else -f)
+    leg_act = "BUY" if side < 0 else "SELL"
+    for leg in ("BULL", "BEAR"):
+        g = market(leg, leg_act, f, pos.get(leg, 0))
+        pos[leg] = pos.get(leg, 0) + (g if leg_act == "BUY" else -g)
+    a = ST.arb_acc.setdefault(label + (": sell RITC / buy basket" if side < 0 else ": buy RITC / sell basket"), [0, 0])
+    a[0] += f
+    a[1] = edge
+    return f
+
+
 def arb(snap, tick):
-    if ST.paused or snap["tick"] < ST.conv_busy_until or busy("RITC", "BULL", "BEAR"):
+    if snap["tick"] < ST.conv_busy_until or busy("RITC", "BULL", "BEAR"):
         return False
-    q, pos, bk = snap["q"], effective_pos(snap), snap["books"]
+    if ST.paused and not ST.pending:
+        return False
+    q, pos = snap["q"], effective_pos(snap)
     if max(abs(pos.get(l, 0) + pos.get("RITC", 0)) for l in ("BULL", "BEAR")) > URGENT_GAP:
         return False                     # still hedging a tender: don't add more
-    ub, ua = q["USD"]
-    rb, ra = q["RITC"]
-    bull_b, bull_a = q["BULL"]
-    bear_b, bear_a = q["BEAR"]
     if not quotes_ok(q):
         return False
-    sell_etf = rb * ub - (bull_a + bear_a) - 3 * FEE    # sell RITC, buy basket
-    buy_etf = (bull_b + bear_b) - ra * ua - 3 * FEE     # buy RITC, sell basket
-    if max(sell_etf, buy_etf) > MAX_SANE_EDGE:
+    ub, ua = q["USD"]
+    top_sell = q["RITC"][0] * ub - (q["BULL"][1] + q["BEAR"][1]) - 3 * FEE
+    top_buy = (q["BULL"][0] + q["BEAR"][0]) - q["RITC"][1] * ua - 3 * FEE
+    if max(top_sell, top_buy) > MAX_SANE_EDGE:
         return False                     # a price is stale/missing (e.g. at tick 0): not a real edge
-    r = pos.get("RITC", 0)
-    gl, nl = snap["gross_limit"], snap["net_limit"]
-    size = min(ARB_CLIP, bk["RITC"]["bids"][0][1] if bk["RITC"]["bids"] else 0,
-               bk["BULL"]["asks"][0][1] if bk["BULL"]["asks"] else 0,
-               bk["BEAR"]["asks"][0][1] if bk["BEAR"]["asks"] else 0)
     ticks_left = snap.get("ticks", 300) - tick
     if ticks_left <= QUIET_TICKS:
         return False
     flatten = ticks_left <= FLATTEN_TICKS
-    can_open = ticks_left > NO_OPEN_TICKS
-    room_target = 0 if flatten else ROOM_TARGET
-    unwind_edge = FLATTEN_EDGE if flatten else ROOM_UNWIND_EDGE
-    room_unwind = abs(r) > room_target   # holding big pairs from a tender (or near the end): shrink them
-    if r > 0 and room_unwind and unwind_edge < sell_etf <= ARB_CLOSE_EDGE:
-        qty = min(size, r - room_target)
-        if qty >= 100:
-            f = market("RITC", "SELL", qty, r)
-            pos["RITC"] = r - f
-            if f:
-                a = ST.arb_acc.setdefault(("FLATTEN" if flatten else "UNWIND for room") + ": sell RITC / buy basket", [0, 0])
-                a[0] += f
-                a[1] = sell_etf
-            return f > 0
-    if r < 0 and room_unwind and unwind_edge < buy_etf <= ARB_CLOSE_EDGE:
-        size_b = min(ARB_CLIP, bk["RITC"]["asks"][0][1] if bk["RITC"]["asks"] else 0,
-                     bk["BULL"]["bids"][0][1] if bk["BULL"]["bids"] else 0,
-                     bk["BEAR"]["bids"][0][1] if bk["BEAR"]["bids"] else 0)
-        qty = min(size_b, -r - room_target)
-        if qty >= 100:
-            f = market("RITC", "BUY", qty, r)
-            pos["RITC"] = r + f
-            if f:
-                a = ST.arb_acc.setdefault(("FLATTEN" if flatten else "UNWIND for room") + ": buy RITC / sell basket", [0, 0])
-                a[0] += f
-                a[1] = buy_etf
-            return f > 0
-    if sell_etf > (ARB_CLOSE_EDGE if r > 0 else ARB_OPEN_EDGE) and (r > 0 or can_open):
-        qty = min(size, r) if r > 0 else min(size, ARB_MAX_PAIRS + r)
-        if qty >= 100 and usage(pos, gl, nl, d_ritc=-qty, d_bull=qty, d_bear=qty) <= LIMIT_USAGE_MAX:
-            f = market("RITC", "SELL", qty, r)
-            pos["RITC"] = r - f
-            if f:
-                a = ST.arb_acc.setdefault("SELL RITC / buy basket", [0, 0])
-                a[0] += f
-                a[1] = sell_etf
-            return f > 0
-    size = min(ARB_CLIP, bk["RITC"]["asks"][0][1] if bk["RITC"]["asks"] else 0,
-               bk["BULL"]["bids"][0][1] if bk["BULL"]["bids"] else 0,
-               bk["BEAR"]["bids"][0][1] if bk["BEAR"]["bids"] else 0)
-    if buy_etf > (ARB_CLOSE_EDGE if r < 0 else ARB_OPEN_EDGE) and (r < 0 or can_open):
-        qty = min(size, -r) if r < 0 else min(size, ARB_MAX_PAIRS - r)
-        if qty >= 100 and usage(pos, gl, nl, d_ritc=qty, d_bull=-qty, d_bear=-qty) <= LIMIT_USAGE_MAX:
-            f = market("RITC", "BUY", qty, r)
-            pos["RITC"] = r + f
-            if f:
-                a = ST.arb_acc.setdefault("BUY RITC / sell basket", [0, 0])
-                a[0] += f
-                a[1] = buy_etf
-            return f > 0
+    can_open = ticks_left > NO_OPEN_TICKS and not ST.pending and not ST.paused
+    r = pos.get("RITC", 0)
+    gl, nl = snap["gross_limit"], snap["net_limit"]
+    # 1) shrink existing pairs: at a profit always; at a small loss for room / the end / a pending tender
+    if abs(r) >= 100:
+        side = -1 if r > 0 else 1
+        room_target = 0 if flatten else (ARB_MAX_PAIRS if ARB_BIG else ROOM_TARGET)
+        cands = [(ARB_CLOSE_EDGE, abs(r), "CLOSE")]
+        if abs(r) > room_target:
+            cands.append((FLATTEN_EDGE if flatten else ROOM_UNWIND_EDGE, abs(r) - room_target,
+                          "FLATTEN" if flatten else "UNWIND for room"))
+        need = pending_need(snap)
+        if need:
+            cands.append((-ST.pending["max_cost"], need, "UNWIND for tender"))
+        best = (0, None, "")
+        for thr, cap, label in cands:
+            n, e = pair_size(snap, side, thr, min(ARB_CLIP, cap))
+            if n > best[0]:
+                best = (n, e, label)
+        if best[0] >= 100:
+            return trade_pair(side, best[0], pos, best[2], best[1]) > 0
+    # 2) open / grow pairs
+    if not can_open:
+        return False
+    for side in (-1, 1):
+        if r * side < 0:
+            continue                     # that side shrinks pairs: handled above
+        cap = min(ARB_CLIP, ARB_MAX_PAIRS - abs(r))
+        if cap < 100:
+            continue
+        n, e = pair_size(snap, side, ARB_OPEN_EDGE, cap)
+        if n >= 100 and usage(pos, gl, nl, d_ritc=side * n, d_bull=-side * n, d_bear=-side * n) <= LIMIT_USAGE_MAX:
+            return trade_pair(side, n, pos, "ARB", e) > 0
     return False
 
 
@@ -879,10 +969,18 @@ def converters(snap, tick):
     pos, gl, nl = snap["pos"], snap["gross_limit"], snap["net_limit"]
     need = blocks_to_convert(pos, gl, nl, d_ritc=ST.ritc_plan)
     r = pos.get("RITC", 0) + ST.ritc_plan
-    if (tick - ST.last_tender_tick >= ROOM_CONVERT_AFTER and tick > ST.fast_until
+    if (not ARB_BIG and tick - ST.last_tender_tick >= ROOM_CONVERT_AFTER and tick > ST.fast_until
             and ticks_total - tick > ROOM_CONVERT_MIN_LEFT):
         # the market didn't shrink the tender's pairs: convert down toward ROOM_CONVERT_ABOVE so the next one fits
         need = max(need, math.ceil(max(0.0, abs(r) - ROOM_CONVERT_ABOVE) / CONVERT_BLOCK))
+    p_need = pending_need(snap)
+    if p_need >= CONVERT_BLOCK / 2:
+        # help a pending tender fit, but only when the market can't unwind pairs at an acceptable cost right now:
+        # a conversion locks the ETF tickers for 2-3 ticks, and the market does 10k in one loop
+        side = -1 if r > 0 else 1
+        n_mkt, _ = pair_size(snap, side, -ST.pending["max_cost"], min(ARB_CLIP, p_need))
+        if n_mkt < 1000:
+            need = max(need, math.ceil(p_need / CONVERT_BLOCK))
     if need == 0:
         return
     sgn = 1 if r > 0 else -1
@@ -962,6 +1060,7 @@ def main():
             ST.shadow_share, ST.shadow_obs, ST.basket_hist, ST.fill_costs = SHADOW_START, [], {}, []
             ST.fast_until, ST.last_tender_tick = -1, -100
             ST.leased = False
+            ST.pending = None
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -975,7 +1074,7 @@ def main():
         if not snap:
             time.sleep(LOOP_SLEEP)
             continue
-        took = handle_tenders(snap, tick)
+        took = check_pending(snap, tick) or handle_tenders(snap, tick)
         if took:
             snap = snapshot_at(tick, ticks) or snap
         ST.last_quotes = snap["q"]
