@@ -934,14 +934,20 @@ def arb(snap, tick):
 
 # ------------------------------- 3b. market making in RITC -------------------------------
 def mm_cancel_all():
-    for oid in list(ST.mm_orders):
-        _req("DELETE", f"/orders/{oid}")
-    ST.mm_orders = {}
+    """Cancel our MM quotes. They stay tracked until they leave the open orders, so a fill just before the cancel
+    is still counted, and an order whose cancel failed (timeout) is retried next tick instead of being forgotten
+    (in a real heat a forgotten 10k bid rested 46 ticks and filled during the end-of-heat flatten)."""
+    for oid, info in ST.mm_orders.items():
+        if "cancelled" in info:
+            continue
+        r = _req("DELETE", f"/orders/{oid}")
+        if r is not None and r.ok:
+            info["cancelled"] = info["qty"] - info["filled"]
 
 
 def mm(snap, tick, orders):
     """Keep one resting RITC bid at fair-MM_EDGE and one ask at fair+MM_EDGE (USD); log fills."""
-    if not MM_ON:
+    if not MM_ON or orders is None:   # open orders unknown this tick (API busy): change nothing, look next tick
         return
     q = snap["q"]
     mine = {o["order_id"]: o for o in orders if o.get("ticker") == "RITC" and o.get("type", "LIMIT") == "LIMIT"}
@@ -950,14 +956,32 @@ def mm(snap, tick, orders):
     fair = (sum(q["BULL"]) / 2 + sum(q["BEAR"]) / 2) / u if quotes_ok(q) else None
     for oid, info in list(ST.mm_orders.items()):
         o = mine.get(oid)
-        filled = (o.get("quantity_filled", 0) if o else info["qty"] - info.get("cancelled", 0))
-        if o is None and not info.get("cancelled"):
+        gone = o is None
+        if not gone:
+            filled = o.get("quantity_filled", 0)
+        else:
+            # Gone from the open orders: filled or cancelled. Ask the server how much really filled. Never ASSUME
+            # a fill: under rate limits (429) both calls can fail, and the old "assume all filled" logged
+            # phantom fills (10k at a time in the real heats) and stopped tracking an order still resting.
+            filled = None
             r = _req("GET", f"/orders/{oid}")
             if r is not None and r.ok:
                 try:
-                    filled = r.json().get("quantity_filled", filled)
+                    j = r.json()
+                    filled = j.get("quantity_filled")
+                    if j.get("status") == "OPEN":
+                        gone = False          # still resting: the open-orders list was incomplete
                 except ValueError:
                     pass
+            if filled is None:
+                if "cancelled" in info:       # we cancelled it ourselves: nothing more filled since we looked
+                    filled = info["qty"] - info["cancelled"]
+                else:
+                    info["unknown"] = info.get("unknown", 0) + 1
+                    if info["unknown"] < 5:
+                        continue              # keep tracking it and ask again next tick
+                    _req("DELETE", f"/orders/{oid}")   # give up: make sure it can't rest unwatched
+                    filled = info["filled"]   # count no fill; a real one is still hedged (hedge follows positions)
         new = filled - info["filled"]
         if new > 0 and fair:
             e = (fair - info["price"]) if info["side"] == "BUY" else (info["price"] - fair)
@@ -968,7 +992,7 @@ def mm(snap, tick, orders):
                               f"({e:+.3f} USD vs fair)  | heat total {ST.mm_stats[0]:,.0f} sh, "
                               f"avg {ST.mm_stats[1] / ST.mm_stats[0]:+.3f} CAD/sh before hedge")
         info["filled"] = filled
-        if o is None:
+        if gone:
             del ST.mm_orders[oid]
     ticks_left = snap.get("ticks", 300) - tick
     pos = effective_pos(snap)
@@ -986,12 +1010,30 @@ def mm(snap, tick, orders):
         want["BUY"] = (math.floor((fair - MM_EDGE) * 100) / 100, int(min(MM_SIZE, MM_MAX - r)))
     if r > -MM_MAX and usage(pos, gl, nl, d_ritc=-MM_SIZE, d_bull=MM_SIZE, d_bear=MM_SIZE) <= LIMIT_USAGE_MAX:
         want["SELL"] = (math.ceil((fair + MM_EDGE) * 100) / 100, int(min(MM_SIZE, MM_MAX + r)))
-    have = {info["side"]: (oid, info) for oid, info in ST.mm_orders.items()}
+    # Only MM rests RITC limit orders. One we don't know about = a quote whose POST timed out after the server
+    # took it: track it so it gets requoted/cancelled like the others instead of resting unwatched.
+    for oid, o in mine.items():
+        if oid not in ST.mm_orders and o.get("action") in ("BUY", "SELL"):
+            ST.mm_orders[oid] = {"side": o["action"], "price": float(o.get("price") or 0),
+                                 "qty": int(o.get("quantity") or 0), "filled": o.get("quantity_filled", 0) or 0}
+            event(tick, "MM", f"found an untracked RITC {o['action'].lower()} order @ {o.get('price')}: tracking it")
+    have = {}
+    for oid, info in ST.mm_orders.items():
+        if "cancelled" in info:
+            continue
+        if info["side"] in have:          # two live quotes on one side: cancel the older one
+            old = have[info["side"]][0]
+            r = _req("DELETE", f"/orders/{old}")
+            if r is not None and r.ok:
+                ST.mm_orders[old]["cancelled"] = ST.mm_orders[old]["qty"] - ST.mm_orders[old]["filled"]
+        have[info["side"]] = (oid, info)
     for side in ("BUY", "SELL"):
         cur = have.get(side)
         w = want.get(side)
         if cur and (not w or abs(cur[1]["price"] - w[0]) >= MM_REQUOTE - 1e-9):
-            _req("DELETE", f"/orders/{cur[0]}")
+            r = _req("DELETE", f"/orders/{cur[0]}")
+            if r is None or not r.ok:
+                continue          # cancel failed: keep tracking it and retry next tick; never stack a second quote
             ST.mm_orders[cur[0]]["cancelled"] = cur[1]["qty"] - cur[1]["filled"]
             cur = None
         if w and not cur and w[1] >= 100:
@@ -1229,7 +1271,7 @@ def main():
         if arb(snap, tick):
             hedge(snap, tick, passive=False)
         if first_of_tick:
-            mm(snap, tick, open_orders())
+            mm(snap, tick, get("/orders", status="OPEN"))   # None if the call failed (not [])
             fx_hedge(snap)
 
         if tick != last_print:

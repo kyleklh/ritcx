@@ -2,7 +2,6 @@
 
     python mm_report.py                         # every run in logs/
     python mm_report.py logs/etf_20261121_*     # some runs (prefix, .txt or .jsonl all work)
-    python mm_report.py --rebate 0.01           # if the limit rebate turns out to be 0.01, not 0.03
     python mm_report.py --csv mm_fills.csv      # also write one row per MM fill
 
 For every MM fill (the "MM | filled ..." lines in etf_<time>.txt) it finds the BULL/BEAR hedge that followed in
@@ -169,6 +168,7 @@ def analyse_heat(jrecs, txt, my_id, rebate):
                 item["markout"][k] = sgn * (mid(qk, "BULL") + mid(qk, "BEAR") - f["price"] * (mid(qk, "USD") or u))
         res.append(item)
     res.sort(key=lambda x: x["tick"])
+    res, phantom, untracked = confirm_fills(res, jrecs, ticks, txt)
     open_needs = {leg: [] for leg in LEGS}   # FIFO of [fill_index, direction, remaining]
     nxt = 0                                  # next fill whose hedge window has not opened yet
 
@@ -203,7 +203,18 @@ def analyse_heat(jrecs, txt, my_id, rebate):
             n = float(resp.get("quantity_filled") or 0) * (1 if r["action"] == "BUY" else -1)
             d = mkt_by_tick.setdefault(r["tick"], {leg: 0.0 for leg in LEGS})
             d[r["ticker"]] += n
-    known_id = my_id not in (None, "self", "mock")
+    # passive leg fills = position change between tick records that no market order explains; a late position
+    # update shows as +X then -X on the next records, so opposite changes close together cancel out first
+    ks = sorted(ticks)
+    leg_passive = {}
+    for leg in LEGS:
+        ser = {}
+        for k0, k1 in zip(ks, ks[1:]):
+            mk = sum(mkt_by_tick.get(k, {}).get(leg, 0.0) for k in range(k0, k1))
+            d = ((ticks[k1].get("pos") or {}).get(leg, 0) or 0) - ((ticks[k0].get("pos") or {}).get(leg, 0) or 0) - mk
+            if abs(d) >= 1:
+                ser[k0] = d
+        leg_passive[leg] = net_lag(ser)
     prev = None
     for r in jrecs:
         # The algo hedges as soon as the RITC position moves, which can be up to a tick BEFORE its "MM | filled"
@@ -232,16 +243,13 @@ def analyse_heat(jrecs, txt, my_id, rebate):
         # position changes since the last tick record that no market order explains = passive fills
         if prev is not None:
             for leg in LEGS:
-                mk = sum(mkt_by_tick.get(k, {}).get(leg, 0.0) for k in range(prev["tick"], tick))
-                d = (pos.get(leg, 0) or 0) - (prev["pos"].get(leg, 0) or 0) - mk
+                d = leg_passive[leg].get(prev["tick"], 0.0)
                 if abs(d) >= 100:
                     direction = 1 if d > 0 else -1
                     bk = (prev.get("books") or {}).get(leg, {})
                     side = "bids" if direction > 0 else "asks"
                     p0 = our_price(bk, side, my_id)
-                    if p0 is None and known_id:
-                        continue      # no resting order of ours on that side: a late position update, not a fill
-                    if p0 is None:
+                    if p0 is None:            # our order not in the logged levels: assume it filled at the touch
                         pq = (prev.get("quotes") or {}).get(leg, (0, 0))
                         p0 = pq[0] if direction > 0 else pq[1]
                     allocate(leg, direction, abs(d), lambda p0=p0: (p0, rebate), "passive", prev["tick"])
@@ -269,7 +277,70 @@ def analyse_heat(jrecs, txt, my_id, rebate):
     for x in res:
         x["rebate"] = rebate
         x["net"] = x["qty"] * (x["edge"] + rebate) - x["hedge_cost"]
-    return res
+    return res, phantom, untracked
+
+
+def net_lag(ser, span=2):
+    """Cancel opposite position changes within `span` ticks of each other (a fill shown late, not a real trade)."""
+    ser = dict(ser)
+    ks = sorted(ser)
+    for i, k in enumerate(ks):
+        for k2 in ks[i + 1:]:
+            if k2 - k > span or abs(ser[k]) < 1:
+                break
+            if ser[k] * ser[k2] < 0:
+                c = min(abs(ser[k]), abs(ser[k2]))
+                ser[k] -= c if ser[k] > 0 else -c
+                ser[k2] -= c if ser[k2] > 0 else -c
+    return ser
+
+
+def confirm_fills(res, jrecs, ticks, txt):
+    """Keep only MM fills the RITC position confirms. Passive RITC fills = RITC position change between two tick
+    records that our RITC market orders don't explain (tender and converter ticks are left out). Returns the
+    confirmed fills (qty cut to what the position shows), the phantom ones (logged, but the position never moved:
+    the old algo assumed a fill when the API was busy) and passive RITC fills no logged fill accounts for."""
+    mkt = {}
+    for r in jrecs:
+        resp = r.get("resp") or {}
+        if r["type"] == "order" and r.get("ticker") == "RITC" and resp.get("status") == "TRANSACTED":
+            mkt[r["tick"]] = mkt.get(r["tick"], 0.0) + float(resp.get("quantity_filled") or 0) * (
+                1 if r["action"] == "BUY" else -1)
+    skip = set()
+    for r in jrecs:
+        if r["type"] == "convert":
+            skip.update(range(r["tick"] - 1, r["tick"] + 4))
+    for t, tag in txt["events"]:
+        if tag == "TENDER":
+            skip.update(range(t - 1, t + 3))
+    ks = sorted(ticks)
+    passive = {}                         # tick -> signed RITC passive change seen right after it
+    for k0, k1 in zip(ks, ks[1:]):
+        if k0 in skip:
+            continue
+        p0 = (ticks[k0].get("pos") or {}).get("RITC", 0) or 0
+        p1 = (ticks[k1].get("pos") or {}).get("RITC", 0) or 0
+        d = p1 - p0 - sum(mkt.get(k, 0.0) for k in range(k0, k1))
+        if abs(d) >= 1:
+            passive[k0] = d
+    passive = {k: d for k, d in net_lag(passive).items() if abs(d) >= 100}
+    kept, phantom = [], []
+    for x in res:
+        want, got = x["qty"], 0.0
+        for k in range(x["tick"] - 3, x["tick"] + 2):
+            d = passive.get(k, 0.0)
+            if d * x["sgn"] <= 0 or got >= want:
+                continue
+            take = min(abs(d), want - got)
+            got += take
+            passive[k] = d - x["sgn"] * take
+        if got < 100:
+            phantom.append(x)
+            continue
+        x["qty"] = int(round(got))
+        kept.append(x)
+    untracked = [(k, d) for k, d in sorted(passive.items()) if abs(d) >= 100]
+    return kept, phantom, untracked
 
 
 def summarise(rows, label):
@@ -295,7 +366,7 @@ def summarise(rows, label):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="*", help="log prefixes/files/folders (default: logs/)")
-    ap.add_argument("--rebate", type=float, default=0.03, help="limit order rebate CAD/share (default 0.03)")
+    ap.add_argument("--rebate", type=float, default=0.03, help="limit order rebate CAD/share (RIT case info: 0.03)")
     ap.add_argument("--csv", help="write one row per MM fill to this file")
     ap.add_argument("--fills", action="store_true", help="print every fill")
     a = ap.parse_args()
@@ -313,12 +384,18 @@ def main():
         if len(theats) != len(jheats):
             print(f"{os.path.basename(jpath)}: {len(theats)} heats in .txt vs {len(jheats)} in .jsonl; matching by order")
         for h, (jh, th) in enumerate(zip(jheats, theats), 1):
-            rows = analyse_heat(jh, th, my_id, a.rebate)
+            rows, phantom, untracked = analyse_heat(jh, th, my_id, a.rebate)
             name = f"{os.path.basename(jpath)[:-6]} heat {h}"
             for r in rows:
                 r["run"] = name
             allrows += rows
-            print(f"\n{name}" + ("" if rows else ": no MM fills"))
+            print(f"\n{name}" + ("" if rows else ": no confirmed MM fills"))
+            if phantom:
+                print(f"  ! {len(phantom)} logged MM fills never showed in the RITC position (phantom, left out): "
+                      + ", ".join(f"t={x['tick']} {x['side']} {x['qty']:,}" for x in phantom))
+            if untracked:
+                print(f"  ! passive RITC fills no MM line accounts for (an order the algo lost track of?): "
+                      + ", ".join(f"t={k} {d:+,.0f}" for k, d in untracked))
             if not rows:
                 continue
             if a.fills:
@@ -346,8 +423,7 @@ def main():
     else:
         verdict = f"TURN OFF: set MM_ON=0 in .env (net {net:+.3f} CAD/sh on {n:,.0f} shares)"
     print(f"\nVERDICT: {verdict}")
-    if abs(a.rebate - 0.01) > 1e-9:
-        print(f"(rebate assumed {a.rebate:.2f}; if the real rebate is 0.01, rerun with --rebate 0.01)")
+    print(f"(rebate {a.rebate:.2f}/sh, as in the RIT case info)")
     if a.csv:
         with open(a.csv, "w", newline="") as f:
             w = csv.writer(f)
