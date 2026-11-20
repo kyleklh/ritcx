@@ -1027,6 +1027,8 @@ def mm(snap, tick, orders):
             if r is not None and r.ok:
                 ST.mm_orders[old]["cancelled"] = ST.mm_orders[old]["qty"] - ST.mm_orders[old]["filled"]
         have[info["side"]] = (oid, info)
+    # 1) cancel every stale quote first, both sides. Posting the new bid before the old ask is gone let a price
+    #    jump cross our own quotes (heat 25: new bid 24.62 traded against our old ask 24.58 = a self-trade).
     for side in ("BUY", "SELL"):
         cur = have.get(side)
         w = want.get(side)
@@ -1035,16 +1037,26 @@ def mm(snap, tick, orders):
             if r is None or not r.ok:
                 continue          # cancel failed: keep tracking it and retry next tick; never stack a second quote
             ST.mm_orders[cur[0]]["cancelled"] = cur[1]["qty"] - cur[1]["filled"]
-            cur = None
-        if w and not cur and w[1] >= 100:
-            resp = _req("POST", "/orders", ticker="RITC", type="LIMIT", quantity=w[1], action=side, price=f"{w[0]:.2f}")
-            if resp is not None and resp.ok:
-                try:
-                    oid = resp.json().get("order_id")
-                except ValueError:
-                    oid = None
-                if oid is not None:
-                    ST.mm_orders[oid] = {"side": side, "price": w[0], "qty": w[1], "filled": 0}
+            del have[side]
+    # 2) post the missing quotes, never at a price that would trade with one of our own orders that may still rest
+    #    (one whose cancel failed, or is still being processed)
+    live = [i for i in ST.mm_orders.values() if i["qty"] - i["filled"] > 0]
+    for side in ("BUY", "SELL"):
+        w = want.get(side)
+        if not w or side in have or w[1] < 100:
+            continue
+        if side == "BUY" and any(i["side"] == "SELL" and i["price"] <= w[0] + 1e-9 for i in live):
+            continue
+        if side == "SELL" and any(i["side"] == "BUY" and i["price"] >= w[0] - 1e-9 for i in live):
+            continue
+        resp = _req("POST", "/orders", ticker="RITC", type="LIMIT", quantity=w[1], action=side, price=f"{w[0]:.2f}")
+        if resp is not None and resp.ok:
+            try:
+                oid = resp.json().get("order_id")
+            except ValueError:
+                oid = None
+            if oid is not None:
+                ST.mm_orders[oid] = {"side": side, "price": w[0], "qty": w[1], "filled": 0}
 
 
 # ------------------------------- 4. FX -------------------------------
