@@ -144,20 +144,11 @@ Batch test, 6 heats at 5x speed:
    market order the algo does not trade that ticker again until the fill shows (or `INFLIGHT_TIMEOUT` passes),
    and it resizes resting orders and the FX hedge once per tick. Without this, a slow server makes the hedges
    re-send and flip-flop (2.5M USD orders back and forth). Test it with `MOCK_ARGS="--pos-lag 0.15" ./test_etf_batch.sh`.
-5. **Converters (automatic)**: the organizers' intro slide says "Converters: manual or API use". While the fully
+5. **Converters (automatic)**: the organizers confirmed the algo may use the converters through the API (the case PDF still says human-only). While the fully
    hedged book would not fit under `CONVERT_TARGET` usage, the algo leases ETF-Redemption / ETF-Creation and uses
    them one 10k block at a time through the RIT API (`CONVERT` lines in the log). If the server refuses, it prints
    `CONVERTER API NOT AVAILABLE` and switches to `>>> CONVERTER ... NOW` prompts for you to click.
    To always click yourself: `$env:AUTO_CONVERT="0"; python etf_algo.py`.
-
-6. **Late fills**: the real server can show a fill in `/securities` a moment after the order returns. After a
-   market order the algo does not trade that ticker again until the fill shows (or `INFLIGHT_TIMEOUT` passes),
-   and it resizes resting orders and the FX hedge once per tick. Without this, a slow server makes the hedges
-   re-send and flip-flop (2.5M USD orders back and forth). Test it with `MOCK_ARGS="--pos-lag 0.15" ./test_etf_batch.sh`.
-5. **Converters (human only)**: the case rules say the algo may NOT use the converters, so it never calls
-   them. While the fully hedged book would not fit under `CONVERT_TARGET` usage, it prints
-   `>>> CONVERTER: REDEEM 1 x 10,000 NOW` (long RITC) or `CREATE` (short RITC), and you click that converter
-   in the RIT Client Assets tab. One click per prompt; each use takes 2 ticks.
 
 ### Operator during the heat
 

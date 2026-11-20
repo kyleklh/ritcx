@@ -14,9 +14,10 @@ converges for free at the end. Profit comes from the price at which we enter the
   5. CONVERTERS: tenders (70k-100k RITC) are too big to hedge with stock alone, because a hedged
      share uses 4 units of gross (RITC counts 2x). So we accept the tender, hedge what fits, and
      redeem/create hedged 10k blocks: each block cancels RITC against BULL+BEAR and frees 40k of
-     gross for the next part of the hedge. The case rules say converters are HUMAN ONLY: the algo
-     never calls a converter/lease endpoint on the real server. It prints
-     ">>> CONVERTER: REDEEM 1 x 10,000 NOW" and you click it in the RIT Client Assets tab.
+     gross for the next part of the hedge. The case PDF says converters are human-only, but the organizers
+     confirmed the algo may use them through the API: it leases ETF-Redemption / ETF-Creation and converts
+     one 10k block at a time. If the server refuses, it falls back to printing
+     ">>> CONVERTER: REDEEM 1 x 10,000 NOW" prompts for you to click in the RIT Client Assets tab.
 
 Live commands (type + Enter):  p / r  pause / resume tenders+arb (hedging continues)
                                s      status        q  quit
@@ -90,7 +91,7 @@ CONVERT_FEE_USD = 1500            # per block
 CONVERT_TICKS = 2                 # one use takes this many ticks; one use at a time
 CONVERT_TARGET = 0.90             # convert hedged blocks until the fully hedged book fits under this usage
 CONVERT_STOP_BEFORE_END = 5       # no new conversions in the last N ticks
-# Converters: the case PDF says human-only, but the organizers' intro slide allows automating them.
+# Converters: the case PDF says human-only, but the organizers confirmed API use is allowed.
 # AUTO_CONVERT=1 (default): the algo leases and uses them through the RIT API (/leases). If the server
 # refuses, it falls back to printing prompts for you to click. AUTO_CONVERT=0: prompts only.
 AUTO_CONVERT = os.environ.get("AUTO_CONVERT", "1") == "1"
