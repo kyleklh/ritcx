@@ -247,6 +247,7 @@ class Sim:
 
 
 SIM = None
+ORDER_LATENCY = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -318,6 +319,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/v1/orders":
+            if ORDER_LATENCY:
+                time.sleep(ORDER_LATENCY)    # like a real round trip: the order fills at the quote when it ARRIVES
             code, obj = SIM.order(q.get("ticker"), q.get("action", "").upper(),
                                   int(float(q.get("quantity", 0))), q.get("type", "MARKET").upper(),
                                   float(q["price"]) if "price" in q else None)
@@ -363,6 +366,8 @@ def main():
     p.add_argument("--half-life", type=float, default=20.0, help="ticks for market maker to close half the vol gap")
     p.add_argument("--mm-start", type=float, default=None, help="market maker's starting vol (-1 = random 15-40%%)")
     p.add_argument("--range-miss", type=float, default=0.0, help="probability a forecast range misses the true vol")
+    p.add_argument("--order-latency", type=float, default=0.0,
+                   help="seconds each order waits before it executes (live RIT: a burst can run into the next tick)")
     p.add_argument("--strike-sd", type=float, default=0.0,
                    help="per-strike vol noise each tick, like the real server (try 0.012)")
     p.add_argument("--reset-sd", type=float, default=0.0,
@@ -370,7 +375,8 @@ def main():
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true", help="start a new heat after each one ends")
     args = p.parse_args()
-    global SIM
+    global SIM, ORDER_LATENCY
+    ORDER_LATENCY = args.order_latency
     SIM = Sim(args.tick, args.seed, half_life=args.half_life)
     # Listen on IPv4 AND IPv6 localhost. Windows tries IPv6 (::1) first for "localhost"; if nothing
     # listens there it waits ~2 s per request before falling back, which makes the algos crawl.
