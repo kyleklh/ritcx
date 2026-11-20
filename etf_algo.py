@@ -106,6 +106,15 @@ ARB_OPEN_EDGE = 0.10 if ARB_BIG else 0.03   # CAD/share net of 3 fees, to OPEN /
 ARB_CLOSE_EDGE = 0.06 if ARB_BIG else 0.00   # CAD/share net of fees, to CLOSE existing pairs
 ARB_CLIP = 10000 if ARB_BIG else 5000
 ARB_STEP = 1000               # sizes tried when walking the books
+# Self-check: after every opening trade, compare the edge we planned with what the fills gave. Other teams' bots race
+# for the same gaps (practice, 5 traders: openings planned +0.11, realized -0.05). If the last ARB_GUARD_N openings
+# realized less than ARB_GUARD_MIN on average, demand ARB_GUARD_STEP more edge (up to ARB_GUARD_MAX); give it back
+# when they realize more than ARB_GUARD_OK.
+ARB_GUARD_N = 4
+ARB_GUARD_MIN = 0.02
+ARB_GUARD_OK = 0.06
+ARB_GUARD_STEP = 0.05
+ARB_GUARD_MAX = 0.30
 HOLD_MIN_EDGE = 0.15          # only tenders this good are worth paying to make room for (practice: two HOLDs at
                               # 0.09-0.11 cost ~2.2k of unwinding and the edge was gone 2 ticks later)
 PENDING_SHARE = 0.6           # a good tender blocked by limits: spend up to this share of its edge unwinding pairs
@@ -206,6 +215,9 @@ class State:
     route_tick = -1
     leased = False
     pending = None        # a good tender we're making room for: {"t": tender, "deadline": tick}
+    last_vwap = {}        # ticker -> vwap of our last market order
+    arb_real = []         # realized edges of recent opening trades
+    arb_extra = 0.0       # extra edge demanded by the self-check
     last_tender_tick = -100
 
 
@@ -276,6 +288,7 @@ def market(ticker, action, qty, cur):
     jlog({"type": "order", "tick": ST.now_tick, "t": round(time.time(), 3), "ticker": ticker, "action": action,
           "qty": qty, "resp": {k: j.get(k) for k in ("order_id", "status", "quantity_filled", "vwap", "price")}})
     filled = int(j.get("quantity_filled") or 0) if j.get("status") == "TRANSACTED" else qty
+    ST.last_vwap[ticker] = float(j["vwap"]) if j.get("vwap") else None
     q_ = ST.last_quotes.get(ticker)
     if j.get("vwap") and q_ and q_[0] > 0 and ticker in ("BULL", "BEAR") and filled:
         mid = (q_[0] + q_[1]) / 2
@@ -814,16 +827,34 @@ def pair_size(snap, side, thr, cap):
     return best, best_e
 
 
-def trade_pair(side, qty, pos, label, edge):
+def trade_pair(side, qty, pos, label, edge, snap=None):
     """All three legs at market, back to back. A leg that fills short is fixed by hedge()."""
     f = market("RITC", "SELL" if side < 0 else "BUY", qty, pos.get("RITC", 0))
     if not f:
         return 0
+    rp = ST.last_vwap.get("RITC")
     pos["RITC"] = pos.get("RITC", 0) + (f if side > 0 else -f)
     leg_act = "BUY" if side < 0 else "SELL"
+    vw = {}
     for leg in ("BULL", "BEAR"):
         g = market(leg, leg_act, f, pos.get(leg, 0))
+        vw[leg] = ST.last_vwap.get(leg) if g else None
         pos[leg] = pos.get(leg, 0) + (g if leg_act == "BUY" else -g)
+    if label == "ARB" and snap and rp and vw.get("BULL") and vw.get("BEAR"):
+        ub, ua = snap["q"]["USD"]
+        real = (rp * ub - vw["BULL"] - vw["BEAR"] if side < 0 else vw["BULL"] + vw["BEAR"] - rp * ua) - 3 * FEE
+        ST.arb_real = (ST.arb_real + [real])[-ARB_GUARD_N:]
+        if len(ST.arb_real) >= ARB_GUARD_N:
+            avg = sum(ST.arb_real) / len(ST.arb_real)
+            old = ST.arb_extra
+            if avg < ARB_GUARD_MIN:
+                ST.arb_extra = min(ARB_GUARD_MAX - ARB_OPEN_EDGE, ST.arb_extra + ARB_GUARD_STEP)
+            elif avg > ARB_GUARD_OK:
+                ST.arb_extra = max(0.0, ST.arb_extra - ARB_GUARD_STEP)
+            if ST.arb_extra != old:
+                ST.arb_real = []
+                event(ST.now_tick, "ARB", f"self-check: last openings realized {avg:+.3f}/sh (planned ~{edge:+.3f}) -> "
+                                          f"open edge now {ARB_OPEN_EDGE + ST.arb_extra:.2f}")
     a = ST.arb_acc.setdefault(label + (": sell RITC / buy basket" if side < 0 else ": buy RITC / sell basket"), [0, 0])
     a[0] += f
     a[1] = edge
@@ -869,7 +900,7 @@ def arb(snap, tick):
             if n > best[0]:
                 best = (n, e, label)
         if best[0] >= 100:
-            return trade_pair(side, best[0], pos, best[2], best[1]) > 0
+            return trade_pair(side, best[0], pos, best[2], best[1], snap) > 0
     # 2) open / grow pairs
     if not can_open:
         return False
@@ -879,9 +910,9 @@ def arb(snap, tick):
         cap = min(ARB_CLIP, ARB_MAX_PAIRS - abs(r))
         if cap < 100:
             continue
-        n, e = pair_size(snap, side, ARB_OPEN_EDGE, cap)
+        n, e = pair_size(snap, side, ARB_OPEN_EDGE + ST.arb_extra, cap)
         if n >= 100 and usage(pos, gl, nl, d_ritc=side * n, d_bull=-side * n, d_bear=-side * n) <= LIMIT_USAGE_MAX:
-            return trade_pair(side, n, pos, "ARB", e) > 0
+            return trade_pair(side, n, pos, "ARB", e, snap) > 0
     return False
 
 
@@ -1066,6 +1097,7 @@ def main():
             ST.fast_until, ST.last_tender_tick = -1, -100
             ST.leased = False
             ST.pending = None
+            ST.arb_real, ST.arb_extra = [], 0.0
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
