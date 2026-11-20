@@ -50,7 +50,15 @@ FAST_ENTRY = os.environ.get("FAST_ENTRY", "0") == "1"   # mock with week-start j
 MAX_ORDERS_PER_LOOP = int(os.environ.get("MAX_ORDERS", 20 if FAST_ENTRY else 4))   # option orders per loop. The market maker's vol jumps at the week
                               # start (t=76/151/226) and the extreme lasts 1-2 ticks; at 4 orders (400 contracts) per
                               # loop a -950 -> +950 flip took ~8 ticks live (heat 2, 16 Nov). RIT allows 50 orders/s.
-MAX_NET_CONTRACTS = 950       # case limit 1000 net; keep a buffer
+MAX_NET_CONTRACTS = int(os.environ.get("MAX_NET", 950))   # case limit 1000 net; keep a buffer. Lower = more gross
+                              # room for the strike engine (gross 2,400 is shared: pairs get (2400 - main book) / 2)
+MAIN_ATM_BAND = float(os.environ.get("MAIN_ATM_BAND", 0))   # 0 = off. >0: the main book only OPENS positions in
+                              # strikes within this many $ of RTM (most vega per contract under the net limit);
+                              # closing is always allowed. The top team took its vol bets in ATM straddles.
+WEEK_SHIFT = os.environ.get("WEEK_SHIFT", "0") == "1"   # week-start mode: for WEEK_TICKS after each week start the
+WEEK_TICKS = int(os.environ.get("WEEK_TICKS", 20))        # main book's net cap drops to WEEK_MAIN_NET and pairs grow
+WEEK_MAIN_NET = int(os.environ.get("WEEK_MAIN_NET", 500))  # to WEEK_ARB_SIZE: the strike gaps are biggest right after
+WEEK_ARB_SIZE = int(os.environ.get("WEEK_ARB_SIZE", 950))  # the market maker's reset (13 pts in test 8 at t=76)
 MAX_GROSS_CONTRACTS = 2400    # case limit 2500 gross
 
 HEDGE_TRIGGER = 2000          # re-hedge when |delta| > this (case limit 7000)
@@ -412,7 +420,7 @@ def quick_hedge(tick, d):
     return d
 
 
-def trade_options(info, tick, gcap):
+def trade_options(info, tick, gcap, S=None):
     if ST.paused or tick >= ST.ticks - STOP_OPENING_TICKS_BEFORE_END:
         return False
     net = sum(o["pos"] for o in info.values())
@@ -431,9 +439,10 @@ def trade_options(info, tick, gcap):
         # opening against the book's remembered direction is a reversal: ask for more edge
         buy_need = REVERSE_EDGE if (ST.book_dir < 0 and o["pos"] >= 0) else MIN_EDGE
         sell_need = REVERSE_EDGE if (ST.book_dir > 0 and o["pos"] <= 0) else MIN_EDGE
-        if o["buy_edge"] > buy_need:
+        near = not (MAIN_ATM_BAND > 0 and S) or abs(o["K"] - S) <= MAIN_ATM_BAND
+        if o["buy_edge"] > buy_need and (o["pos"] < 0 or near):        # closing: any strike; opening: near only
             cands.append((o["pos"] < 0, o["buy_edge"], tk, "BUY"))
-        if o["sell_edge"] > sell_need:
+        if o["sell_edge"] > sell_need and (o["pos"] > 0 or near):
             cands.append((o["pos"] > 0, o["sell_edge"], tk, "SELL"))
     cands.sort(reverse=True)
     cands = [(edge, tk, side) for _, edge, tk, side in cands]
@@ -447,10 +456,10 @@ def trade_options(info, tick, gcap):
         while n_orders < MAX_ORDERS_PER_LOOP:
             pos = info[tk]["pos"]
             if side == "BUY":
-                room_net = MAX_NET_CONTRACTS - net
+                room_net = net_cap(tick) - net
                 room_gross = MAX_GROSS_CONTRACTS - gross if pos >= 0 else max(-pos, MAX_GROSS_CONTRACTS - gross)
             else:
-                room_net = MAX_NET_CONTRACTS + net
+                room_net = net_cap(tick) + net
                 room_gross = MAX_GROSS_CONTRACTS - gross if pos <= 0 else max(pos, MAX_GROSS_CONTRACTS - gross)
             q = min(CLIP, room_net, room_gross)
             # keep the options book hedgeable: skip trades that push |option delta| past the cap
@@ -464,6 +473,8 @@ def trade_options(info, tick, gcap):
             against_book = (side == "BUY" and ST.book_dir < 0) or (side == "SELL" and ST.book_dir > 0)
             if closing:
                 q = min(q, abs(pos)) if q > 0 else 0
+            elif MAIN_ATM_BAND > 0 and S and abs(info[tk]["K"] - S) > MAIN_ATM_BAND:
+                break                                    # far strike: closed down to flat, no new position here
             elif against_book and edge <= REVERSE_EDGE:
                 # this leg was admitted as a CLOSE at MIN_EDGE and is now flat: carrying on would open a
                 # position against the book, which is a reversal and needs REVERSE_EDGE
@@ -495,6 +506,15 @@ def trade_options(info, tick, gcap):
         prev = ST.fill_acc.get(k, (0, edge))[0]
         ST.fill_acc[k] = (prev + qty, edge)
     return traded
+
+
+def in_week_start(tick):
+    start = tick - 1 - ((tick - 1) // ST.week_len) * ST.week_len     # ticks since this week began
+    return WEEK_SHIFT and tick > ST.week_len and start < WEEK_TICKS
+
+
+def net_cap(tick):
+    return min(MAX_NET_CONTRACTS, WEEK_MAIN_NET) if in_week_start(tick) else MAX_NET_CONTRACTS
 
 
 def strike_ivs(info):
@@ -579,7 +599,7 @@ def arb_step(info, tick, S, T):
     if gap * vega < ARB_MIN_DOLLARS:
         return traded
     gross = sum(abs(o["pos_total"]) for o in info.values())
-    n = min(ARB_SIZE, (MAX_GROSS_CONTRACTS - gross) // 2)
+    n = min(WEEK_ARB_SIZE if in_week_start(tick) else ARB_SIZE, (MAX_GROSS_CONTRACTS - gross) // 2)
     if n < CLIP:
         return traded
     buys, sells = straddle(info, lk, n), straddle(info, sk, n)
@@ -854,7 +874,7 @@ def main():
             gcap = gamma_cap(S, vol_for_week(week_of(tick)) or fv)
             traded = trim_gamma(info, tick, gcap)
             traded = rebalance_option_delta(info, tick) or traded
-            traded = trade_options(info, tick, gcap) or traded
+            traded = trade_options(info, tick, gcap, S) or traded
         if traded:
             sec = snapshot() or sec
             info = option_info(sec, S, T, fv)

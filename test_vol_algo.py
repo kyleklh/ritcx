@@ -197,5 +197,49 @@ class StrikeArbTest(unittest.TestCase):
         self.assertFalse(any(va.ST.arb_pos.values()))
         self.assertEqual(self.net_of(), 0)
 
+
+class AtmBandAndWeekStartTest(unittest.TestCase):
+    def setUp(self):
+        va.ST.reset()
+        va.ST.run_delta = 0
+        va.ST.rtm_pos = 0
+        self.orders = []
+        self._place, self._band, self._ws = va.place, va.MAIN_ATM_BAND, va.WEEK_SHIFT
+        va.place = lambda tk, side, q: self.orders.append((tk, side, int(q))) or int(q)
+
+    def tearDown(self):
+        va.place, va.MAIN_ATM_BAND, va.WEEK_SHIFT = self._place, self._band, self._ws
+
+    def bought(self, tk):
+        return sum(q for t, sd, q in self.orders if t == tk and sd == "BUY")
+
+    def test_band_blocks_far_openings_only(self):
+        va.MAIN_ATM_BAND = 1.0
+        info = make_info({"RTM48C": {"buy_edge": 0.30}, "RTM50C": {"buy_edge": 0.10}})
+        va.trade_options(info, 50, gcap=1e9, S=50.0)
+        self.assertEqual(self.bought("RTM48C"), 0)
+        self.assertGreater(self.bought("RTM50C"), 0)
+
+    def test_band_still_lets_far_positions_close(self):
+        va.MAIN_ATM_BAND = 1.0
+        info = make_info({"RTM48C": {"pos": -200, "buy_edge": 0.30}})
+        va.trade_options(info, 50, gcap=1e9, S=50.0)
+        self.assertEqual(self.bought("RTM48C"), 200)       # closes the short, does not go long
+
+    def test_band_off_is_unchanged(self):
+        va.MAIN_ATM_BAND = 0
+        info = make_info({"RTM48C": {"buy_edge": 0.30}})
+        va.trade_options(info, 50, gcap=1e9, S=50.0)
+        self.assertGreater(self.bought("RTM48C"), 0)
+
+    def test_week_start_window(self):
+        va.WEEK_SHIFT = True
+        inside = [t for t in range(1, 300) if va.in_week_start(t)]
+        self.assertEqual(inside, list(range(76, 96)) + list(range(151, 171)) + list(range(226, 246)))
+        self.assertEqual(va.net_cap(80), min(va.MAX_NET_CONTRACTS, va.WEEK_MAIN_NET))
+        self.assertEqual(va.net_cap(120), va.MAX_NET_CONTRACTS)
+        va.WEEK_SHIFT = False
+        self.assertFalse(any(va.in_week_start(t) for t in range(1, 300)))
+
 if __name__ == "__main__":
     unittest.main()
