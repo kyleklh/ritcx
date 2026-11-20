@@ -79,12 +79,15 @@ GAMMA_KEEP_EDGE = float(os.environ.get("GAMMA_KEEP_EDGE", 0.10))  # not cut for 
                               # 22% vol to cut gamma, then vol went to 37%. Never adds risk; 0 turns it off.
 GAMMA_EDGE_UNTIL_END = 30     # ...and only until this many ticks before the end (gamma explodes near expiry)
 ARB_ON = os.environ.get("ARB", "1") == "1"   # strike-vs-strike engine (see arb_step); ARB=0 turns it off
-ARB_MIN_DOLLARS = float(os.environ.get("ARB_MIN_DOLLARS", 16))   # enter when (rich - cheap strike vol) x vega >= this
+ARB_MIN_DOLLARS = float(os.environ.get("ARB_MIN_DOLLARS", 10))   # enter when (rich - cheap strike vol) x vega >= this
                               # per contract. The market maker re-draws each strike's vol every tick (sd ~1.2 pts,
                               # spread across strikes median 2 pts, 90th pct 5 pts, 18 Nov test 8). Backtest on that
                               # heat's real quotes: $12-30 all profitable (+$50k..+$280k), $16 -> +$242k.
 ARB_EXIT = float(os.environ.get("ARB_EXIT", 0.0))   # leave when the gap (vol pts) has closed to this...
-ARB_MAX_HOLD = int(os.environ.get("ARB_MAX_HOLD", 5))   # ...or after this many ticks
+ARB_MAX_HOLD = int(os.environ.get("ARB_MAX_HOLD", 40))   # ...or after this many ticks. Replay of 5 real heats
+                              # with exact quotes vs the old $16/5: $10/40 +$31.8k per heat (4/5 better, worst -$2.2k);
+                              # $16/20 +$13.8k (5/5); $12/20 +$24.6k but worst -$17k. Part of a strike's mispricing
+                              # persists, and the top team holds its pairs ~20 ticks.
 ARB_SIZE = int(os.environ.get("ARB_SIZE", 700))   # contracts per leg (capped by the gross room left)
 ARB_LAST_ENTRY = 30           # no new pairs in the last N ticks; all unwound before the t=285 close-out
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
