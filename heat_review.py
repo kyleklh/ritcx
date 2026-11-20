@@ -16,9 +16,9 @@ What it checks (latest heat unless said otherwise):
   arb            how often the self-check raised the opening edge (other bots taking the gaps)
 
 One suggestion at most, in this order of importance, and only on a clear signal (one heat is noisy):
-  1. connection trouble (>= 20 timeouts or >= 5 slow loops)        -> ARB_BIG=0 (far fewer orders)
-  2. MM losing: >= 20k clean shares and net < -0.02/sh             -> MM_EDGE +0.03 (MM_ON=0 if already 0.35)
-     MM picked off: >= 20k clean shares and edge at fill < 0.15   -> MM_EDGE +0.03
+  1. connection trouble (>= 20 timeouts or >= 15 slow loops)       -> ARB_BIG=0 (far fewer orders)
+  2. MM losing: >= 20k clean shares and net < -0.02/sh             -> MM_EDGE +0.05 (MM_ON=0 if already 0.35)
+     MM picked off: >= 20k clean shares and edge at fill < 0.15   -> MM_EDGE +0.05
   3. accepted tenders: >= 4 today, losing on average after hedging, and 0.08/sh+ worse than estimated
                                                                    -> TENDER_HEDGE_COST +0.05 at most (max 0.30)
   4. arb self-check raised the edge >= 3 times in the heat         -> ARB_BIG=0
@@ -204,13 +204,14 @@ def main():
 
     # one suggestion
     print()
-    if warns >= 20 or slow >= 5:
+    if warns >= 20 or slow >= 15:
         s = ("ARB_BIG=0", f"connection trouble ({warns} timeouts, {slow} slow loops): the big arb sends the most orders")
     elif cs >= 20000 and net < -0.02:
         s = (("MM_ON=0", f"MM lost {net:+.3f}/sh even at the widest distance") if A.MM_EDGE >= 0.35 - 1e-9 else
-             (f"MM_EDGE={min(0.35, A.MM_EDGE + 0.03):.2f}", f"MM lost {net:+.3f}/sh on {cs:,.0f} clean shares"))
+             (f"MM_EDGE={min(0.35, A.MM_EDGE + 0.05):.2f}", f"MM lost {net:+.3f}/sh on {cs:,.0f} clean shares"
+              + (f"; other teams sat at/ahead of our quotes {share_ahead:.0%} of the time" if share_ahead >= 0.3 else "")))
     elif cs >= 20000 and edge < 0.15:
-        s = (f"MM_EDGE={min(0.35, A.MM_EDGE + 0.03):.2f}",
+        s = (f"MM_EDGE={min(0.35, A.MM_EDGE + 0.05):.2f}",
              f"edge at fill only {edge:+.3f}: quotes are being picked off when fair moves")
     elif len(tres) >= 4 and gap >= 0.08 and avg_real < 0 and A.TENDER_HEDGE_COST < 0.30 - 1e-9:
         s = (f"TENDER_HEDGE_COST={min(0.30, A.TENDER_HEDGE_COST + min(0.05, round(gap, 2))):.2f}",
