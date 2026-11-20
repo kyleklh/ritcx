@@ -12,6 +12,7 @@
 | `mock_rit_etf.py --real` | Mock with real book depth/spreads and tenders drawn from the 62 real ones. Good for checking the code runs; NOT for judging P&L (its book refills instantly; it scores the Nov 16 algo at ~+55-80k/heat, real was ~+6k). Judge strategy changes with solo practice + `replay_etf_tenders.py`. |
 | `test_etf_batch.sh` | Runs the ETF algo against many fast mock heats. |
 | `replay_etf_tenders.py` | Replays every tender of a real session against its logged books: raw edge, what hedging really cost, and what the current algo would decide. Settings it calibrates (`TENDER_HEDGE_COST`, `TENDER_MIN_EDGE`, `FAST_SLIP`) can be set in `.env`. |
+| `heat_review.py` | Between heats: one screen on the last heat (health, market making, tenders, arb) and at most one `.env` change to make for the next heat. |
 | `mm_report.py` | After a heat: what the RITC market making really made per share once its hedges are paid, and whether to keep `MM_ON`. |
 | `mm_replay.py` | Replays market making on logged real books at other quote distances (`MM_EDGE`) and inventory skews, calibrated on the real fills. |
 | `analyze_etf_logs.py` | Reads `logs/` after a session: competitors in the books, book depth, whether price pressure after tenders sticks or bounces, what hedges cost, tender estimate vs result. |
