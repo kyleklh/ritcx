@@ -183,7 +183,7 @@ Batch test, 6 heats at 5x speed:
    To always click yourself: `$env:AUTO_CONVERT="0"; python etf_algo.py`.
 
 9. **Patient tender mode** (`TENDER_MODE=patient` in `.env`, off by default): take a tender only if its price beats
-   BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.10 CAD/sh). Then unwind it at the best prices
+   BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.05 CAD/sh; 19 real heats: better than 0.10). Then unwind it at the best prices
    only, in all three books at once: each tick up to `PATIENT_PER_TICK` (10,000) back into RITC plus up to
    `PATIENT_BASKET` (10,000) hedged with BULL+BEAR (a hedged pair the arb closes later). That is flat in about 4-9
    ticks without walking deep into any book (the instant hedge costs 0.2-0.4/sh) and without the long unhedged

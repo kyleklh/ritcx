@@ -65,7 +65,7 @@ TENDER_HEDGE_COST = float(os.environ.get("TENDER_HEDGE_COST", "0.15"))
 # Replay of 10 real heats (Nov 20), one tender at a time: +18k/heat on tenders, 9/10 heats positive, worst ~0.
 TENDER_MODE = os.environ.get("TENDER_MODE", "hedge").strip().lower()
 PATIENT = TENDER_MODE == "patient"
-PATIENT_MIN_EDGE = float(os.environ.get("PATIENT_MIN_EDGE", "0.10"))   # CAD/sh vs the worse of basket and RITC mid
+PATIENT_MIN_EDGE = float(os.environ.get("PATIENT_MIN_EDGE", "0.05"))   # CAD/sh vs the worse of basket and RITC mid
 PATIENT_PER_TICK = int(os.environ.get("PATIENT_PER_TICK", "10000"))      # RITC sold back per tick (best price only)
 PATIENT_BASKET = int(os.environ.get("PATIENT_BASKET", "10000"))         # + hedged per tick with BULL+BEAR best prices
 PATIENT_TICKS = int(os.environ.get("PATIENT_TICKS", "30"))
@@ -1332,6 +1332,10 @@ def main():
     last_print = -1
     me = get("/trader") or {}
     ST.my_id = me.get("trader_id") or "self"
+    import config as _cfg
+    shown = [k for k in _cfg.ENV_KEYS if k not in ("RIT_API_KEY", "ETF_RIT_API_KEY")]
+    say(f"[settings] .env {'read' if _cfg.ENV_FOUND else 'NOT FOUND'} ({_cfg.ENV_PATH}): "
+        + (", ".join(f"{k}={os.environ.get(k)}" for k in shown) or "no settings in it (all defaults)"))
     say(f"[trader id] {ST.my_id}  | market making {'ON' if MM_ON else 'off'} (+-{MM_EDGE:.2f} USD, max {MM_MAX:,})")
     say(f"[tenders] " + (f"PATIENT: take if >= {PATIENT_MIN_EDGE:.2f}/sh better than basket AND RITC, unwind "
                          f"{PATIENT_PER_TICK:,} RITC + {PATIENT_BASKET:,} BULL/BEAR per tick at best prices, stop {PATIENT_STOP:.2f} USD, {PATIENT_TICKS} ticks max"
