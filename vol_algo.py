@@ -134,6 +134,9 @@ class State:
         self.news_file = os.devnull
         self.arb_pos = {}         # ticker -> contracts held by the strike engine (the main book sees the rest)
         self.arb = None           # open pair: dict(long_k, short_k, t0)
+        self.expect = {}          # ticker -> position we expect the server to show, given our own fills
+        self.stale_reads = 0      # snapshots that lagged our fills (re-read); stale_left: still off after POS_SETTLE
+        self.stale_left = 0
 
 
 ST = State()
@@ -161,6 +164,9 @@ LIMIT_ORDERS = os.environ.get("LIMIT_ORDERS", "1") == "1"   # option trades on a
                               # the next tick's price. Hedges and risk cuts stay market orders. LIMIT_ORDERS=0: off.
 
 
+POS_SETTLE_WAIT = float(os.environ.get("POS_SETTLE_WAIT", 0.05))   # seconds between those re-reads
+POS_SETTLE = int(os.environ.get("POS_SETTLE", 3))   # re-reads (50 ms apart) when the server's positions haven't caught up
+                                                   # with our own fills yet; 0 = trust the first read (old behaviour)
 PARALLEL_ORDERS = os.environ.get("PARALLEL_ORDERS", "1") == "1"   # send a basket's orders at the same time instead
                               # of one after another: a 700-lot pair is 14+ orders (max 100 each), which one at a time
                               # can take most of a tick, so later orders land on the next tick's prices.
@@ -210,6 +216,10 @@ def place(ticker, action, qty, limit=None):
             if use_limit:
                 j = settle_limit(j, qty)
             filled = int(j.get("quantity_filled", 0 if use_limit else qty) or 0)
+            if filled:
+                with _EXPECT_LOCK:
+                    if ticker in ST.expect:
+                        ST.expect[ticker] += filled if action == "BUY" else -filled
             MKT.fill(ticker, action, filled, j.get("vwap"))
             return filled
         except requests.RequestException as e:
@@ -411,11 +421,32 @@ def fair_vol(tick):
 
 
 # ------------------------------- trading -------------------------------
+_EXPECT_LOCK = threading.Lock()
+
+
 def snapshot():
-    secs = api_get("/securities")
-    if not secs:
-        return None
-    return {x["ticker"]: x for x in secs}
+    """Positions and quotes. The server can show an order's fill a moment after it reports it to us: hedging on
+    such a read hedges a delta that isn't there, and the next read hedges it back (live: about half of all RTM
+    hedge shares were bought and sold within the same tick). So if any position differs from what our own fills
+    say it should be, wait 50 ms and read again, up to POS_SETTLE times."""
+    for attempt in range(POS_SETTLE + 1):
+        secs = api_get("/securities")
+        if not secs:
+            return None
+        sec = {x["ticker"]: x for x in secs}
+        with _EXPECT_LOCK:
+            off = [tk for tk, n in ST.expect.items() if tk in sec and int(sec[tk]["position"]) != n]
+        if not off:
+            break
+        if attempt == 0:
+            ST.stale_reads += 1
+        if attempt < POS_SETTLE:
+            time.sleep(POS_SETTLE_WAIT)
+    else:
+        ST.stale_left += 1                               # still off: take the server's word (it is the truth)
+    with _EXPECT_LOCK:
+        ST.expect = {tk: int(x["position"]) for tk, x in sec.items() if "position" in x}
+    return sec
 
 
 def option_info(sec, S, T, fv):
@@ -983,7 +1014,7 @@ def main():
             if tick % STATUS_EVERY == 0:
                 mkt = f"{atm_iv:5.1%}" if atm_iv else "  -- "
                 event(tick, "status", f"RTM {S:6.2f}  vol {fv:5.1%} vs mkt {mkt}  net {net:+5d}  "
-                                      f"delta {d:+7,.0f}  P&L {nlv:+9,.0f}")
+                                      f"delta {d:+7,.0f}  P&L {nlv:+9,.0f}  lag {ST.stale_reads}/{ST.stale_left}")
         took = time.time() - loop_start
         if took > 1.0 and tick - ST.last_slow_warn >= 10:
             ST.last_slow_warn = tick

@@ -285,5 +285,55 @@ class EngineStuckTest(unittest.TestCase):
         va.trade_options(info, 50, gcap=1e9)
         self.assertEqual(sum(bought), 0)
 
+
+
+class PositionLagTest(unittest.TestCase):
+    """The server can show a fill a moment late: snapshot() re-reads until positions match our own fills."""
+
+    def setUp(self):
+        va.ST.reset()
+        self._get, self._sleep = va.api_get, va.time.sleep
+        va.time.sleep = lambda s: None
+        self.reads = []
+
+    def tearDown(self):
+        va.api_get, va.time.sleep = self._get, self._sleep
+
+    def serve(self, *positions):
+        seq = list(positions)
+
+        def get(path, **kw):
+            pos = seq.pop(0) if len(seq) > 1 else seq[0]
+            self.reads.append(pos)
+            return [{"ticker": "RTM", "position": pos, "bid": 50, "ask": 50.02}]
+        va.api_get = get
+
+    def test_waits_for_a_lagging_fill(self):
+        self.serve(0)
+        va.snapshot()                                     # baseline: RTM 0
+        va.ST.expect["RTM"] += 5000                       # we just bought 5000
+        self.serve(0, 0, 5000)                            # server shows it on the third read
+        sec = va.snapshot()
+        self.assertEqual(sec["RTM"]["position"], 5000)
+        self.assertEqual((va.ST.stale_reads, va.ST.stale_left), (1, 0))
+
+    def test_gives_up_and_trusts_the_server(self):
+        self.serve(0)
+        va.snapshot()
+        va.ST.expect["RTM"] += 5000
+        self.serve(0)                                     # never shows: the order didn't really fill
+        sec = va.snapshot()
+        self.assertEqual(sec["RTM"]["position"], 0)
+        self.assertEqual(va.ST.stale_left, 1)
+        self.assertEqual(va.ST.expect["RTM"], 0)          # resynced to the server
+
+    def test_no_wait_when_in_sync(self):
+        self.serve(0)
+        va.snapshot()
+        va.snapshot()
+        self.assertEqual(len(self.reads), 2)
+        self.assertEqual(va.ST.stale_reads, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
