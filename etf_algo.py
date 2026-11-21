@@ -78,7 +78,9 @@ PATIENT_PAIR_COST = 0.03      # CAD/sh we charge a BULL+BEAR slice for the pair 
 PATIENT_HOLD_COST = float(os.environ.get("PATIENT_HOLD_COST", "0.06"))  # make room for a good tender by unwinding
                               # pairs in the market at most this much per share (never with converters)
 PATIENT_TICKS = int(os.environ.get("PATIENT_TICKS", "30"))
-PATIENT_STOP = float(os.environ.get("PATIENT_STOP", "0.20"))         # USD/sh against us -> hedge the rest
+PATIENT_STOP = float(os.environ.get("PATIENT_STOP", "0.50"))         # USD/sh against us -> hedge the rest. Was 0.20: on
+                              # the Nov 21 practice heats the 0.20 stop fired on normal swings and cost ~25k more than
+                              # continuing; replay of 19 heats: 0.50 or none best, 0.20 worst
 PATIENT_CUTOFF = int(os.environ.get("PATIENT_CUTOFF", "50"))         # no patient tender this close to the end
 TENDER_MIN_PROFIT = 500       # CAD total; skip tiny wins
 UNHEDGED_PENALTY = 0.03       # CAD/share charged on the part we cannot hedge right away (waits for converters)

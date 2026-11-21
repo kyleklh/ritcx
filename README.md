@@ -197,7 +197,7 @@ Batch test, 6 heats at 5x speed:
    only, in all three books at once: each tick up to `PATIENT_PER_TICK` (10,000) back into RITC plus up to
    `PATIENT_BASKET` (10,000) hedged with BULL+BEAR (a hedged pair the arb closes later). That is flat in about 4-9
    ticks without walking deep into any book (the instant hedge costs 0.2-0.4/sh) and without the long unhedged
-   exposure of selling through RITC alone (which lost 41k in heat 27). Stop-loss `PATIENT_STOP` (0.20 USD) and
+   exposure of selling through RITC alone (which lost 41k in heat 27). Stop-loss `PATIENT_STOP` (0.50 USD; 0.20 fired on normal swings and cost money) and
    `PATIENT_TICKS` (30) hand the rest to the normal hedge; no unwinding pairs at a loss to make room in this mode.
    Replay of 10 real heats (Nov 20), one tender at a time, pair closing cost 0.03-0.08: +11k to +15k/heat,
    positive in 8-10 of 10 heats, worst about -2k. Log lines: `PATIENT | done ...`, `PATIENT | stop-loss ...`.
