@@ -250,7 +250,10 @@ def main():
 
     # one suggestion
     print()
-    if A.PATIENT and len(pt_done) >= 2 and (pt_sum < -10000 or pt_stops >= 2):
+    last_nlv = last.get("nlv") if isinstance(last.get("nlv"), (int, float)) else 0.0
+    if A.PATIENT and len(pt_done) >= 2 and (pt_sum < -10000 or pt_stops >= 2) and last_nlv < 0:
+        # (also needs the heat to end in a loss: 'fair' right after an unwind still carries open pairs and can
+        #  swing +-15k, e.g. Nov 21 11:00: -29.5k on the last tender by this measure, heat ended +8.7k, 2nd of 4)
         s = ("TENDER_MODE=hedge",
              f"patient tenders today: fair moved ${pt_sum:+,.0f} over {len(pt_done)} tenders, {pt_stops} stop-losses. "
              "Switch back to hedge mode (keep TENDER_MIN_EDGE=0.15)")
