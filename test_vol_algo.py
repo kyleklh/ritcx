@@ -189,6 +189,21 @@ class StrikeArbTest(unittest.TestCase):
         self.assertIsNone(va.ST.arb)
         self.assertEqual(self.orders, [])
 
+    def test_switches_to_a_much_better_pair(self):
+        va.arb_step(self.info({49: 0.22, 51: 0.28}), 10, self.S, self.T)      # 6-pt gap: enter 49/51
+        self.assertEqual((va.ST.arb["long_k"], va.ST.arb["short_k"]), (49, 51))
+        self.orders.clear()
+        va.arb_step(self.info({49: 0.22, 51: 0.28, 48: 0.12, 52: 0.38}), 11, self.S, self.T)  # 48/52 now far bigger
+        self.assertIsNone(va.ST.arb)                                          # left 49/51 to switch
+        self.assertFalse(any(va.ST.arb_pos.values()))
+        va.arb_step(self.info({49: 0.22, 51: 0.28, 48: 0.12, 52: 0.38}), 11, self.S, self.T)
+        self.assertEqual((va.ST.arb["long_k"], va.ST.arb["short_k"]), (48, 52))
+
+    def test_no_switch_for_a_slightly_better_pair(self):
+        va.arb_step(self.info({49: 0.22, 51: 0.28}), 10, self.S, self.T)
+        va.arb_step(self.info({49: 0.22, 51: 0.28, 48: 0.215, 52: 0.29}), 11, self.S, self.T)
+        self.assertEqual((va.ST.arb["long_k"], va.ST.arb["short_k"]), (49, 51))
+
     def test_floor_quoted_strike_is_ignored(self):
         # live heat 130427, t=253: 52C quoted 0.01/0.03 at 8% vol made strike 52 look 11 pts rich. Fake gap.
         info = self.info({52: 0.40})

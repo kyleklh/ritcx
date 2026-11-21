@@ -91,6 +91,8 @@ ARB_MAX_HOLD = int(os.environ.get("ARB_MAX_HOLD", 40))   # ...or after this many
                               # $16/20 +$13.8k (5/5); $12/20 +$24.6k but worst -$17k. Part of a strike's mispricing
                               # persists, and the top team holds its pairs ~20 ticks.
 ARB_SIZE = int(os.environ.get("ARB_SIZE", 1000))  # contracts per leg (capped by the gross room left)
+ARB_SWITCH = float(os.environ.get("ARB_SWITCH", 20))   # leave the held pair when another pair's gap is worth this many
+                                                       # $/contract more (0 = never switch); next loop enters the new one
 ARB_LAST_ENTRY = 30           # no new pairs in the last N ticks; all unwound before the t=285 close-out
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
@@ -625,6 +627,22 @@ def arb_orders(info, tick, buys, sells, entry=False):
     return traded
 
 
+def pair_vega(S, T, ivs, lk, sk):
+    """$ per contract per vol point, averaged over the two strikes."""
+    return (bs.vega(S, lk, T, ivs[lk]) + bs.vega(S, sk, T, ivs[sk])) / 2
+
+
+def best_pair(info, ivs, S, T):
+    """(cheap strike, rich strike, $ gap per contract) or None.
+    A strike whose call or put is bid at the 1-cent floor has a fake vol: the far option is worth ~0 and the
+    near one ~intrinsic, so a 1-cent rounding moves its vol by many points. Its "gap" is pure fees and spread."""
+    ok = {k: v for k, v in ivs.items() if min(info[CALLS[k]]["bid"], info[PUTS[k]]["bid"]) >= ARB_MIN_BID - 1e-9}
+    if len(ok) < 2:
+        return None
+    lk, sk = min(ok, key=ok.get), max(ok, key=ok.get)
+    return lk, sk, (ok[sk] - ok[lk]) * 100 * pair_vega(S, T, ok, lk, sk)
+
+
 def arb_step(info, tick, S, T):
     """Strike-vs-strike engine. The market maker re-draws each strike's vol every tick around a common level.
     Buy a delta-neutral straddle at the cheapest strike, sell one at the richest, both N contracts, so net
@@ -638,13 +656,23 @@ def arb_step(info, tick, S, T):
     if ST.arb:
         a = ST.arb
         gap = (ivs[a["short_k"]] - ivs[a["long_k"]]) * 100 if a["short_k"] in ivs and a["long_k"] in ivs else 0
-        if gap <= ARB_EXIT or tick - a["t0"] >= ARB_MAX_HOLD or tick >= end:
+        better = None
+        if ARB_SWITCH > 0 and gap > ARB_EXIT and not a.get("fails"):
+            best = best_pair(info, ivs, S, T)
+            if best and (best[0], best[1]) != (a["long_k"], a["short_k"]):
+                cur = gap * pair_vega(S, T, ivs, a["long_k"], a["short_k"])
+                if best[2] - cur >= ARB_SWITCH:
+                    better = best
+        if better or gap <= ARB_EXIT or tick - a["t0"] >= ARB_MAX_HOLD or tick >= end:
             held = {tk: n for tk, n in ST.arb_pos.items() if n}
             traded = arb_orders(info, tick, {tk: -n for tk, n in held.items() if n < 0},
                                 {tk: n for tk, n in held.items() if n > 0})
-            event(tick, "ARB", f"out: {a['long_k']}/{a['short_k']} after {tick - a['t0']} ticks, gap now {gap:+.1f} pts")
+            why = f"; switching to {better[0]}/{better[1]} (${better[2]:,.0f}/contract)" if better else ""
+            event(tick, "ARB", f"out: {a['long_k']}/{a['short_k']} after {tick - a['t0']} ticks, gap now {gap:+.1f} pts{why}")
             if not any(ST.arb_pos.values()):
                 ST.arb = None
+                if better:
+                    return traded                        # enter the better pair next loop, on fresh positions
             else:
                 a["fails"] = a.get("fails", 0) + 1
                 if a["fails"] < 3:
@@ -655,17 +683,12 @@ def arb_step(info, tick, S, T):
                 ST.arb = None
     if ST.arb or ST.paused or tick >= ST.ticks - ARB_LAST_ENTRY or len(ivs) < 2:
         return traded
-    # A strike whose call or put is bid at the 1-cent floor has a fake vol: the far option is worth ~0 and the
-    # near one ~intrinsic, so a 1-cent rounding moves its vol by many points. Its "gap" is pure fees and spread.
-    ivs = {k: v for k, v in ivs.items()
-           if min(info[CALLS[k]]["bid"], info[PUTS[k]]["bid"]) >= ARB_MIN_BID - 1e-9}
-    if len(ivs) < 2:
+    best = best_pair(info, ivs, S, T)
+    if best is None or best[2] < ARB_MIN_DOLLARS:
         return traded
-    lk, sk = min(ivs, key=ivs.get), max(ivs, key=ivs.get)
+    lk, sk, dollars = best
     gap = (ivs[sk] - ivs[lk]) * 100
-    vega = (bs.vega(S, lk, T, ivs[lk]) + bs.vega(S, sk, T, ivs[sk])) / 2     # $ per contract per vol point
-    if gap * vega < ARB_MIN_DOLLARS:
-        return traded
+    vega = pair_vega(S, T, ivs, lk, sk)
     gross = sum(abs(o["pos_total"]) for o in info.values())
     n = min(ARB_SIZE, (MAX_GROSS_CONTRACTS - gross) // 2)
     if n < CLIP:
