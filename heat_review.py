@@ -99,6 +99,29 @@ def tender_results(run):
     return out
 
 
+def patient_results(lines, patient_run=False):
+    """Patient-mode tenders in one heat's log lines: accept tick, size, estimated edge, how the unwind ended,
+    and how 'fair' (P&L with RITC at basket value) moved from just before the tender to 5 ticks after it ended."""
+    fair, out, cur = [], [], None
+    for line in lines:
+        m = re.match(r"t=\s*(\d+) \| status .*fair\s+([+-]?[\d,]+)", line)
+        if m:
+            fair.append((int(m.group(1)), float(m.group(2).replace(",", ""))))
+        m = re.search(r"t=\s*(\d+) \| TENDER\s*\| ACCEPT\s+(BUY|SELL)\s+([\d,.]+) RITC @ ([\d.]+)\s+edge ([+-][\d.]+)", line)
+        if m and (patient_run or "patient" in line):
+            cur = {"t0": int(m.group(1)), "side": m.group(2), "qty": int(float(m.group(3).replace(",", ""))),
+                   "est": float(m.group(5)), "end": None, "how": "still open at the end"}
+            out.append(cur)
+        m = re.search(r"t=\s*(\d+) \| PATIENT\s*\| (done|stop-loss|time limit)", line)
+        if m and cur and cur["end"] is None:
+            cur["end"], cur["how"] = int(m.group(1)), m.group(2)
+    for x in out:
+        before = [f for t, f in fair if t <= x["t0"]]
+        after = [f for t, f in fair if t >= (x["end"] or x["t0"] + 30) + 5]
+        x["fair_change"] = (after[0] - before[-1]) if before and after else None
+    return out
+
+
 def competitors(jrecs, my_id):
     """Other teams (not ANON, not us) quoting RITC, and on how many of our quoting ticks one was at/ahead of us."""
     seen, ahead, quoting = {}, 0, 0
@@ -198,13 +221,40 @@ def main():
         print(f"            on average: estimated {sum(x['est'] for x in tres) / len(tres):+.3f}, "
               f"real {avg_real:+.3f}/sh, total ${sum(x['real'] * x['qty'] for x in tres):+,.0f}")
 
+    # patient mode: every patient tender today, judged by what 'fair' did across it
+    ptres = []
+    for r_ in today:
+        try:
+            with open(r_ + ".txt", encoding="utf-8", errors="replace") as fh:
+                prun = "[tenders] PATIENT" in fh.read(4000)
+            for h_i, lines_ in enumerate(txt_heats(r_ + ".txt"), 1):
+                if r_ == run and h_i > hi + 1:
+                    break
+                ptres += [dict(x, run=os.path.basename(r_), heat=h_i) for x in patient_results(lines_, prun)]
+        except OSError:
+            pass
+    if A.PATIENT or ptres:
+        print(f"patient     tenders today in patient mode: {len(ptres)}")
+        for x in ptres:
+            fc = "n/a" if x["fair_change"] is None else f"${x['fair_change']:+,.0f}"
+            took = f"{x['end'] - x['t0']} ticks" if x["end"] else "-"
+            print(f"              {x['run'][4:]} heat {x['heat']} t={x['t0']:3d} {x['side']:<4} {x['qty']:,}: estimated "
+                  f"{x['est']:+.3f}/sh, {x['how']} after {took}, fair moved {fc}")
+    pt_done = [x for x in ptres if x["fair_change"] is not None]
+    pt_sum = sum(x["fair_change"] for x in pt_done)
+    pt_stops = sum(1 for x in ptres if x["how"] == "stop-loss")
+
     # arb
     selfchk = sum(1 for l in tlines if "self-check" in l and "->" in l)
     print(f"arb         self-check raised the opening edge {selfchk} times")
 
     # one suggestion
     print()
-    if warns >= 20 or slow >= 15:
+    if A.PATIENT and len(pt_done) >= 2 and (pt_sum < -10000 or pt_stops >= 2):
+        s = ("TENDER_MODE=hedge",
+             f"patient tenders today: fair moved ${pt_sum:+,.0f} over {len(pt_done)} tenders, {pt_stops} stop-losses. "
+             "Switch back to hedge mode (keep TENDER_MIN_EDGE=0.15)")
+    elif warns >= 20 or slow >= 15:
         s = ("ARB_BIG=0", f"connection trouble ({warns} timeouts, {slow} slow loops): the big arb sends the most orders")
     elif cs >= 20000 and net < -0.02:
         s = (("MM_ON=0", f"MM lost {net:+.3f}/sh even at the widest distance") if A.MM_EDGE >= 0.35 - 1e-9 else
