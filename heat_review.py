@@ -266,7 +266,7 @@ def main():
     elif cs >= 20000 and edge < 0.15:
         s = (f"MM_EDGE={min(0.35, A.MM_EDGE + 0.05):.2f}",
              f"edge at fill only {edge:+.3f}: quotes are being picked off when fair moves")
-    elif (len(tres) >= 4 and gap >= 0.08 and avg_real < 0
+    elif (not A.PATIENT and len(tres) >= 4 and gap >= 0.08 and avg_real < 0
           and A.TENDER_HEDGE_COST + A.TENDER_MIN_EDGE < 0.30 - 1e-9):   # not when the bar is already raised
         s = (f"TENDER_HEDGE_COST={min(0.30, A.TENDER_HEDGE_COST + min(0.05, round(gap, 2))):.2f}",
              f"the {len(tres)} tenders taken today lost {avg_real:+.3f}/sh on average after hedging, "
