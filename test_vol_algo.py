@@ -180,8 +180,8 @@ class StrikeArbTest(unittest.TestCase):
         self.assertEqual(va.ST.arb["long_k"], 49)
         self.assertEqual(va.ST.arb["short_k"], 51)
         self.assertEqual(self.net_of(), 0)
-        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM49")), 700)
-        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM51")), -700)
+        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM49")), va.ARB_SIZE)
+        self.assertEqual(sum(n for tk, n in va.ST.arb_pos.items() if tk.startswith("RTM51")), -va.ARB_SIZE)
 
     def test_small_gap_is_ignored(self):
         info = self.info({49: 0.248, 51: 0.252})        # 0.4 pts: a few $ per contract, below the threshold
