@@ -59,6 +59,8 @@ GAMMA_Z = float(os.environ.get("GAMMA_Z", 1.5))                # size the book s
                               # 1.5 beat 2.0 by ~$5k/heat on the mock (MM half-life 5-10); 1.0 and 0.75 added
                               # penalty (up to $5k in a heat) with no extra profit.
                               # Higher = safer/smaller. Gamma grows near expiry, so this shrinks size automatically.
+QUICK_HEDGE_AT = int(os.environ.get("QUICK_HEDGE_AT", 2000))   # hedge INSIDE a loop (between option orders) only past
+                              # this; the end-of-loop hedge still brings delta back inside HEDGE_TRIGGER
 HEDGE_TARGET = 0
 RTM_MAX_ORDER = 10000
 RTM_LIMIT = 49000             # case limit 50000
@@ -542,7 +544,7 @@ def trade_options(info, tick, gcap):
             gross += abs(old_total + sgn * filled) - abs(old_total)
             traded = True
             ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
-            if abs(ST.run_delta) > HEDGE_TRIGGER:
+            if abs(ST.run_delta) > QUICK_HEDGE_AT:
                 ST.run_delta = quick_hedge(tick, ST.run_delta)
             k = (side, tk)
             fills[k] = (fills.get(k, (0, edge))[0] + filled, edge)
@@ -622,7 +624,7 @@ def arb_orders(info, tick, buys, sells, entry=False):
                 ST.arb_pos[tk] = ST.arb_pos.get(tk, 0) + sgn * filled
                 info[tk]["pos_total"] += sgn * filled
                 ST.run_delta += sgn * filled * 100 * info[tk]["delta"]
-    if abs(ST.run_delta) > HEDGE_TRIGGER:                # one hedge for the whole basket
+    if abs(ST.run_delta) > QUICK_HEDGE_AT:                # one hedge for the whole basket
         ST.run_delta = quick_hedge(tick, ST.run_delta)
     return traded
 
@@ -744,7 +746,7 @@ def trim_gamma(info, tick, gcap):
         o["pos"] += chg
         book_g += chg * 100 * o["gamma"]
         ST.run_delta += chg * 100 * o["delta"]
-        if abs(ST.run_delta) > HEDGE_TRIGGER:
+        if abs(ST.run_delta) > QUICK_HEDGE_AT:
             ST.run_delta = quick_hedge(tick, ST.run_delta)
         traded = True
         event(tick, "RISK", f"{side} {filled} {tk} to cut gamma (gamma {book_g:,.0f}, cap {gcap:,.0f})")
@@ -806,7 +808,7 @@ def close_options(info, tick, S):
                 break
             o["pos"] += -filled if side == "SELL" else filled
             ST.run_delta += (-filled if side == "SELL" else filled) * 100 * o["delta"]
-            if abs(ST.run_delta) > HEDGE_TRIGGER:
+            if abs(ST.run_delta) > QUICK_HEDGE_AT:
                 ST.run_delta = quick_hedge(tick, ST.run_delta)
             traded = True
         if n >= MAX_ORDERS_PER_LOOP:
