@@ -73,6 +73,7 @@ class Sim:
         self.tick = 0
         self.status = "ACTIVE"
         self.pos = {t: 0 for t in TICKERS}
+        self.pos_hist = []        # (time, positions) after each fill, for --pos-lag
         self.cash = 0.0
         self.fees = 0.0
         self.penalty = 0.0
@@ -223,6 +224,8 @@ class Sim:
             self.cash -= sign * qty * SIZE[ticker] * px + fee
             self.fees += fee
             self.pos = new
+            if POS_LAG:
+                self.pos_hist.append((time.time(), dict(new)))
             oid = len(self.orders) + 1
             o = {"order_id": oid, "period": 1, "tick": self.tick, "trader_id": "mock", "ticker": ticker,
                  "type": otype, "quantity": qty, "action": action, "price": price,
@@ -234,12 +237,27 @@ class Sim:
             return 200, o
 
     # ---------- API views ----------
+    def shown_pos(self):
+        """Positions as /securities shows them: with --pos-lag, the state as of POS_LAG seconds ago."""
+        if not POS_LAG:
+            return self.pos
+        cut = time.time() - POS_LAG
+        shown = None
+        for t, p in self.pos_hist:
+            if t > cut:
+                break
+            shown = p
+        if shown is None:
+            shown = {t: 0 for t in TICKERS} if self.pos_hist else self.pos
+        return shown
+
     def securities(self):
         out = []
+        shown = self.shown_pos()
         for t in TICKERS:
             bid, ask = self.quote(t)
             out.append({"ticker": t, "type": "STOCK" if t == "RTM" else "OPTION", "size": SIZE[t],
-                        "position": self.pos[t], "last": round(self.mid(t), 2), "bid": bid, "ask": ask,
+                        "position": shown[t], "last": round(self.mid(t), 2), "bid": bid, "ask": ask,
                         "bid_size": 1_000_000, "ask_size": 1_000_000, "is_tradeable": True,
                         "volume": self.volume[t],
                         "max_trade_size": MAX_ORDER[t], "trading_fee": FEE[t]})
@@ -248,6 +266,7 @@ class Sim:
 
 SIM = None
 ORDER_LATENCY = 0.0
+POS_LAG = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -372,11 +391,14 @@ def main():
                    help="per-strike vol noise each tick, like the real server (try 0.012)")
     p.add_argument("--reset-sd", type=float, default=0.0,
                    help="MM vol jumps to true vol + N(0, this) at each week start, like the real server (try 0.15)")
+    p.add_argument("--pos-lag", type=float, default=0.0,
+                   help="seconds /securities positions trail the fills (live RIT seems to show fills a moment late)")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true", help="start a new heat after each one ends")
     args = p.parse_args()
-    global SIM, ORDER_LATENCY
+    global SIM, ORDER_LATENCY, POS_LAG
     ORDER_LATENCY = args.order_latency
+    POS_LAG = args.pos_lag
     SIM = Sim(args.tick, args.seed, half_life=args.half_life)
     # Listen on IPv4 AND IPv6 localhost. Windows tries IPv6 (::1) first for "localhost"; if nothing
     # listens there it waits ~2 s per request before falling back, which makes the algos crawl.
