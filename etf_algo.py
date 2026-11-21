@@ -1307,9 +1307,11 @@ def converters(snap, tick):
     pos, gl, nl = snap["pos"], snap["gross_limit"], snap["net_limit"]
     need = blocks_to_convert(pos, gl, nl, d_ritc=ST.ritc_plan)
     r = pos.get("RITC", 0) + ST.ritc_plan
-    if (not ARB_BIG and tick - ST.last_tender_tick >= ROOM_CONVERT_AFTER and tick > ST.fast_until
+    if (not ARB_BIG and not PATIENT and tick - ST.last_tender_tick >= ROOM_CONVERT_AFTER and tick > ST.fast_until
             and ticks_total - tick > ROOM_CONVERT_MIN_LEFT):
-        # the market didn't shrink the tender's pairs: convert down toward ROOM_CONVERT_ABOVE so the next one fits
+        # the market didn't shrink the tender's pairs: convert down toward ROOM_CONVERT_ABOVE so the next one fits.
+        # Not in patient mode: there the arb shrinks pairs in the market for ~0.00-0.04/sh, a conversion costs 0.15
+        # (practice heat Nov 21 09:00: 5 room conversions = 7.5k USD, turning +2.8k into -4.7k)
         need = max(need, math.ceil(max(0.0, abs(r) - ROOM_CONVERT_ABOVE) / CONVERT_BLOCK))
     p_need = pending_need(snap)
     if p_need >= CONVERT_BLOCK / 2:
