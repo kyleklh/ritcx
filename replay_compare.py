@@ -12,6 +12,7 @@ Older flat files (vol_log_X.csv + news_raw_X.txt) can be sorted into that layout
 one replay is one sample. Repeat k uses the same jitter for every version, so the comparison is paired. The per-heat difference between versions is what to look at, not the totals.
 """
 import argparse
+import csv
 import glob
 import os
 import re
@@ -40,6 +41,8 @@ def heat_files(folder):
 def checkout(ref, tmp):
     if ref == "WORKTREE":
         return HERE
+    if os.path.isdir(ref):                       # a folder holding a vol_algo.py (e.g. a copy with other defaults)
+        return os.path.abspath(ref)
     path = os.path.join(tmp, re.sub(r"\W", "_", ref))
     subprocess.run(["git", "-C", HERE, "worktree", "add", "-q", "--detach", path, ref], check=True)
     return path
@@ -50,20 +53,23 @@ def run_batch(jobs, tick, loop_sleep):
     procs = []
     for j, (label, heat, code, csv_path, news, rep) in enumerate(jobs):
         port = 9800 + j
+        qpath = os.path.join(os.path.dirname(csv_path), "quotes.csv")
         args = ["--csv", csv_path, "--port", str(port), "--tick", str(tick), "--start-delay", "1.5",
-                "--jitter-seed", str(rep)] + (["--news", news] if news else [])
+                "--jitter-seed", str(rep)] + (["--news", news] if news else []) + \
+               (["--quotes", qpath] if os.path.exists(qpath) else [])
         srv = subprocess.Popen([sys.executable, os.path.join(HERE, "replay_rit_vol.py")] + args,
                                cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         procs.append((label, heat, code, port, srv))
     time.sleep(0.7)
-    algos = []
+    algos, wds = [], []
     for label, heat, code, port, srv in procs:
         wd = tempfile.mkdtemp(prefix="replay_")
+        wds.append(wd)
         env = dict(os.environ, VOL_LOG_DIR=os.path.join(wd, "logs"), RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
         algos.append(subprocess.Popen([sys.executable, os.path.join(code, "vol_algo.py")], cwd=wd, env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     out = []
-    for (label, heat, code, port, srv), algo in zip(procs, algos):
+    for (label, heat, code, port, srv), algo, wd in zip(procs, algos, wds):
         try:
             txt = srv.communicate(timeout=300 * tick + 30)[0]
         except subprocess.TimeoutExpired:
@@ -73,8 +79,21 @@ def run_batch(jobs, tick, loop_sleep):
         m, lv = PAT.search(txt), LIVE.search(txt)
         vals = tuple(float(x.replace(",", "")) for x in m.groups()) if m else (None, None, None)
         live = float(lv.group(2).replace(",", "")) if lv and lv.group(2) != "nan" else None
-        out.append((label, heat) + vals + (live,))
+        out.append((label, heat) + vals + (live, stalled_ticks(wd)))
     return out
+
+
+def stalled_ticks(wd):
+    """Ticks the algo skipped (a slow API call at 5x speed can freeze it for ~10 ticks, which is worth
+    ~$100k on a heat: the replay result is then about the stall, not the code)."""
+    logs = glob.glob(os.path.join(wd, "logs", "*", "vol_log.csv"))
+    if not logs:
+        return 300
+    with open(logs[0], newline="") as f:
+        ticks = sorted({int(r["tick"]) for r in csv.DictReader(f)})
+    if not ticks:
+        return 300
+    return sum(1 for t in range(ticks[0], 285) if t not in ticks)
 
 
 def main():
@@ -101,18 +120,19 @@ def main():
             print(f"  {min(i + a.parallel, len(jobs))}/{len(jobs)} runs done", flush=True)
     finally:
         for r, path in codes.items():
-            if path != HERE:
+            if path != HERE and not os.path.isdir(r):
                 subprocess.run(["git", "-C", HERE, "worktree", "remove", "--force", path])
     for x in sorted(res, key=lambda x: (x[1], x[0])):
         print(f"  {os.path.basename(x[1].rstrip('/')):<12} {x[0][:14]:<14} " +
-              (f"P&L {x[2]:>10,.0f}  fees {x[3]:>8,.0f}  penalty {x[4]:>6,.0f}" if x[2] is not None else "FAILED"))
+              (f"P&L {x[2]:>10,.0f}  fees {x[3]:>8,.0f}  penalty {x[4]:>6,.0f}" if x[2] is not None else "FAILED") +
+              (f"   STALLED: skipped {x[6]} ticks, left out" if x[6] > 2 else ""))
     print(f"\n{'heat':<22}{'live':>10}" + "".join(f"{r[:14]:>26}" for r in a.refs))
     diffs = []
     for h in a.heats:
         live = next((x[5] for x in res if x[1] == h and x[5] is not None), None)
         cells, means = [], []
         for r in a.refs:
-            p = [x[2] for x in res if x[0] == r and x[1] == h and x[2] is not None]
+            p = [x[2] for x in res if x[0] == r and x[1] == h and x[2] is not None and x[6] <= 2]
             means.append(statistics.mean(p) if p else None)
             sd = statistics.stdev(p) if len(p) > 1 else 0
             cells.append(f"{statistics.mean(p):>14,.0f} (sd {sd:>6,.0f})" if p else f"{'failed':>24}")

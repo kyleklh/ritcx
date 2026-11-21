@@ -126,9 +126,21 @@ def infer_news(path):
     return out
 
 
+def load_quotes(path):
+    """quotes.csv from the market log: (tick, ticker) -> (bid, ask). Exact quotes for every strike."""
+    out = {}
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            b, a = float(r["bid"] or 0), float(r["ask"] or 0)
+            if b > 0 and a > 0:
+                out[(int(r["tick"]), r["ticker"])] = (b, a)
+    return out
+
+
 class ReplaySim(mock.Sim):
-    def __init__(self, tick_seconds, rows, first, last, news, jitter_seed=None, jitter=0.001):
+    def __init__(self, tick_seconds, rows, first, last, news, jitter_seed=None, jitter=0.001, quotes=None):
         super().__init__(tick_seconds, seed=0)
+        self.logged = quotes or {}      # exact per-strike quotes when the heat has quotes.csv
         self.true_vols = ["replay"]
         # The algo is path-sensitive: a 1-cent quote change can flip a trade near a threshold and the
         # heat then plays out differently (about +-$5k). The logged vol already carries that much rounding
@@ -140,6 +152,19 @@ class ReplaySim(mock.Sim):
         self.tick = first - 1
         self.S, self.mm_vol = rows[first][0], rows[first][1]
         self._publish(upto=first - 1)            # news from before the join is already out
+
+    def quote(self, t):
+        q = self.logged.get((self.tick, t))
+        if q is None and self.logged:                    # a tick the logger missed: use the last one seen
+            for back in range(1, 4):
+                q = self.logged.get((self.tick - back, t))
+                if q:
+                    break
+        return q if q else super().quote(t)
+
+    def mid(self, t):
+        q = self.logged and self.quote(t)
+        return (q[0] + q[1]) / 2 if q else super().mid(t)
 
     def _publish(self, upto):
         while self.pending and self.pending[0][0] <= upto:
@@ -172,12 +197,14 @@ def main():
     p.add_argument("--tick", type=float, default=1.0)
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--jitter-seed", type=int, default=None, help="add 0.1-vol-pt noise with this seed (see ReplaySim)")
+    p.add_argument("--quotes", default=None, help="quotes.csv from the market log: replay the exact quotes")
     a = p.parse_args()
     rows, first, last = load_rows(a.csv)
     news = load_news(a.news) if a.news else infer_news(a.csv)
     live = rows[last][2]
     print(f"[replay] ticks {first}-{last}, {len(news)} news items, live P&L at t={last}: {live:,.0f}", flush=True)
-    mock.SIM = ReplaySim(a.tick, rows, first, last, news, jitter_seed=a.jitter_seed)
+    quotes = load_quotes(a.quotes) if a.quotes else None
+    mock.SIM = ReplaySim(a.tick, rows, first, last, news, jitter_seed=None if quotes else a.jitter_seed, quotes=quotes)
     server = mock.ThreadingHTTPServer(("127.0.0.1", a.port), mock.Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     time.sleep(a.start_delay)

@@ -45,7 +45,8 @@ def parse_option(t):
 
 
 class Sim:
-    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0, reset_sd=0.0):
+    def __init__(self, tick_seconds, seed, ticks=300, half_life=20.0, mm_start=None, range_miss=0.0, reset_sd=0.0,
+                 strike_sd=0.0, strike_rho=0.35):
         self.rng = random.Random(seed)
         self.tick_seconds = tick_seconds
         self.ticks = ticks
@@ -58,7 +59,10 @@ class Sim:
         alt = random.Random(None if seed is None else seed + 1_000_000)
         self.alt = alt
         self.range_miss = range_miss
-        self.reset_sd = reset_sd        # real server (16 Nov logs): at each week start the MM's vol JUMPS to
+        self.reset_sd = reset_sd
+        self.strike_sd, self.strike_rho = strike_sd, strike_rho   # real server (19 Nov): each strike's vol is
+        self.dev = {k: 0.0 for k in STRIKES}                        # re-drawn every tick, sd ~1.2 pts, lag-1 corr 0.35
+        self.noise = random.Random(None if seed is None else seed + 2_000_000)        # real server (16 Nov logs): at each week start the MM's vol JUMPS to
                                         # roughly true vol +- 15 pts (often the wrong way), then drifts back
         if mm_start is None:
             mm_start = 0.25
@@ -74,6 +78,8 @@ class Sim:
         self.penalty = 0.0
         self.news = []
         self.orders = []
+        self.volume = {t: 0 for t in TICKERS}   # market volume per ticker (all traders; here only us)
+        self.tas = []                            # time & sales: every trade in the market
         # (the real server's t=1 message is added in step(); nothing is published at tick 0)
 
     # ---------- pricing ----------
@@ -84,7 +90,7 @@ class Sim:
         if t == "RTM":
             return self.S
         K, f = parse_option(t)
-        return bs.price(f, self.S, K, self.T(), self.mm_vol)
+        return bs.price(f, self.S, K, self.T(), max(0.01, self.mm_vol + self.dev[K]))
 
     def quote(self, t):
         m = self.mid(t)
@@ -126,6 +132,10 @@ class Sim:
             # market maker learns the true vol with a lag
             k = 1 - 0.5 ** (1 / self.half_life)
             self.mm_vol += (sigma - self.mm_vol) * k
+            if self.strike_sd:
+                for k in STRIKES:
+                    self.dev[k] = (self.strike_rho * self.dev[k] +
+                                   math.sqrt(1 - self.strike_rho ** 2) * self.noise.gauss(0, self.strike_sd))
             if self.reset_sd and w > 1 and self.tick == (w - 1) * self.week_len + 1:
                 self.mm_vol = max(0.05, sigma + self.alt.gauss(0, self.reset_sd))
             # news
@@ -177,14 +187,14 @@ class Sim:
               f"(fees {self.fees:,.2f}, penalty {self.penalty:,.2f})", flush=True)
 
     # ---------- orders ----------
-    def order(self, ticker, action, qty, otype):
+    def order(self, ticker, action, qty, otype, price=None):
         with self.lock:
             if self.status != "ACTIVE":
                 return 400, {"code": "INVALID", "message": "Case is not active"}
             if ticker not in TICKERS:
                 return 400, {"code": "INVALID", "message": "Unknown ticker"}
-            if otype != "MARKET":
-                return 400, {"code": "INVALID", "message": "Mock supports MARKET orders only"}
+            if otype not in ("MARKET", "LIMIT") or (otype == "LIMIT" and price is None):
+                return 400, {"code": "INVALID", "message": "MARKET, or LIMIT with a price"}
             if qty <= 0 or qty > MAX_ORDER[ticker]:
                 return 400, {"code": "INVALID", "message": f"Quantity must be 1..{MAX_ORDER[ticker]}"}
             sign = 1 if action == "BUY" else -1
@@ -200,15 +210,27 @@ class Sim:
                     return 400, {"code": "INVALID", "message": "Options limit exceeded"}
             bid, ask = self.quote(ticker)
             px = ask if sign > 0 else bid
+            if otype == "LIMIT" and (price < px - 1e-9 if sign > 0 else price > px + 1e-9):
+                # not marketable: rests (unfilled) until cancelled. Like RIT it could fill later; the algo cancels
+                # straight away, so the mock never fills it.
+                oid = len(self.orders) + 1
+                o = {"order_id": oid, "period": 1, "tick": self.tick, "trader_id": "mock", "ticker": ticker,
+                     "type": "LIMIT", "quantity": qty, "action": action, "price": price,
+                     "quantity_filled": 0, "vwap": None, "status": "OPEN"}
+                self.orders.append(o)
+                return 200, o
             fee = FEE[ticker] * qty
             self.cash -= sign * qty * SIZE[ticker] * px + fee
             self.fees += fee
             self.pos = new
             oid = len(self.orders) + 1
             o = {"order_id": oid, "period": 1, "tick": self.tick, "trader_id": "mock", "ticker": ticker,
-                 "type": "MARKET", "quantity": qty, "action": action, "price": None,
+                 "type": otype, "quantity": qty, "action": action, "price": price,
                  "quantity_filled": qty, "vwap": px, "status": "TRANSACTED"}
             self.orders.append(o)
+            self.volume[ticker] += qty
+            self.tas.append({"id": len(self.tas) + 1, "period": 1, "tick": self.tick, "ticker": ticker,
+                             "price": px, "quantity": qty})
             return 200, o
 
     # ---------- API views ----------
@@ -219,11 +241,13 @@ class Sim:
             out.append({"ticker": t, "type": "STOCK" if t == "RTM" else "OPTION", "size": SIZE[t],
                         "position": self.pos[t], "last": round(self.mid(t), 2), "bid": bid, "ask": ask,
                         "bid_size": 1_000_000, "ask_size": 1_000_000, "is_tradeable": True,
+                        "volume": self.volume[t],
                         "max_trade_size": MAX_ORDER[t], "trading_fee": FEE[t]})
         return out
 
 
 SIM = None
+ORDER_LATENCY = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -267,6 +291,16 @@ class Handler(BaseHTTPRequestHandler):
                 bid, ask = s.quote(q.get("ticker", "RTM"))
                 return self._send(200, {"bids": [{"price": bid, "quantity": 1_000_000}],
                                         "asks": [{"price": ask, "quantity": 1_000_000}]})
+            if u.path.startswith("/v1/orders/"):
+                for o in s.orders:
+                    if str(o["order_id"]) == u.path.rsplit("/", 1)[1]:
+                        return self._send(200, o)
+                return self._send(404, {"code": "NOT_FOUND", "message": "no such order"})
+            if u.path == "/v1/securities/tas":
+                after = int(q.get("after", 0))
+                rows = [{k: v for k, v in x.items() if k != "ticker"} for x in s.tas
+                        if x["ticker"] == q.get("ticker") and x["id"] > after]
+                return self._send(200, list(reversed(rows)))   # newest first, like RIT
             if u.path == "/v1/news":
                 since = int(q.get("since", 0))
                 items = [n for n in s.news if n["news_id"] > since]
@@ -285,9 +319,25 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/v1/orders":
+            if ORDER_LATENCY:
+                time.sleep(ORDER_LATENCY)    # like a real round trip: the order fills at the quote when it ARRIVES
             code, obj = SIM.order(q.get("ticker"), q.get("action", "").upper(),
-                                  int(float(q.get("quantity", 0))), q.get("type", "MARKET").upper())
+                                  int(float(q.get("quantity", 0))), q.get("type", "MARKET").upper(),
+                                  float(q["price"]) if "price" in q else None)
             return self._send(code, obj)
+        self._send(404, {"code": "NOT_FOUND", "message": u.path})
+
+    def do_DELETE(self):
+        if not self._auth():
+            return
+        u = urlparse(self.path)
+        if u.path.startswith("/v1/orders/"):
+            with SIM.lock:
+                for o in SIM.orders:
+                    if str(o["order_id"]) == u.path.rsplit("/", 1)[1] and o["status"] == "OPEN":
+                        o["status"] = "CANCELLED"
+                        return self._send(200, {"success": True})
+            return self._send(404, {"code": "NOT_FOUND", "message": "no open order with that id"})
         self._send(404, {"code": "NOT_FOUND", "message": u.path})
 
 
@@ -296,7 +346,7 @@ def run_clock(args):
     seed = args.seed
     while True:
         SIM = Sim(args.tick, seed, half_life=args.half_life, mm_start=args.mm_start, range_miss=args.range_miss,
-                  reset_sd=args.reset_sd)
+                  reset_sd=args.reset_sd, strike_sd=args.strike_sd)
         print(f"[mock] new heat, seed={seed}. (true vols hidden; printed at the end)", flush=True)
         time.sleep(args.start_delay)
         while SIM.status == "ACTIVE":
@@ -316,12 +366,17 @@ def main():
     p.add_argument("--half-life", type=float, default=20.0, help="ticks for market maker to close half the vol gap")
     p.add_argument("--mm-start", type=float, default=None, help="market maker's starting vol (-1 = random 15-40%%)")
     p.add_argument("--range-miss", type=float, default=0.0, help="probability a forecast range misses the true vol")
+    p.add_argument("--order-latency", type=float, default=0.0,
+                   help="seconds each order waits before it executes (live RIT: a burst can run into the next tick)")
+    p.add_argument("--strike-sd", type=float, default=0.0,
+                   help="per-strike vol noise each tick, like the real server (try 0.012)")
     p.add_argument("--reset-sd", type=float, default=0.0,
                    help="MM vol jumps to true vol + N(0, this) at each week start, like the real server (try 0.15)")
     p.add_argument("--start-delay", type=float, default=2.0)
     p.add_argument("--loop", action="store_true", help="start a new heat after each one ends")
     args = p.parse_args()
-    global SIM
+    global SIM, ORDER_LATENCY
+    ORDER_LATENCY = args.order_latency
     SIM = Sim(args.tick, args.seed, half_life=args.half_life)
     # Listen on IPv4 AND IPv6 localhost. Windows tries IPv6 (::1) first for "localhost"; if nothing
     # listens there it waits ~2 s per request before falling back, which makes the algos crawl.
