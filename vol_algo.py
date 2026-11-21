@@ -90,7 +90,7 @@ ARB_MAX_HOLD = int(os.environ.get("ARB_MAX_HOLD", 40))   # ...or after this many
                               # with exact quotes vs the old $16/5: $10/40 +$31.8k per heat (4/5 better, worst -$2.2k);
                               # $16/20 +$13.8k (5/5); $12/20 +$24.6k but worst -$17k. Part of a strike's mispricing
                               # persists, and the top team holds its pairs ~20 ticks.
-ARB_SIZE = int(os.environ.get("ARB_SIZE", 700))   # contracts per leg (capped by the gross room left)
+ARB_SIZE = int(os.environ.get("ARB_SIZE", 1000))  # contracts per leg (capped by the gross room left)
 ARB_LAST_ENTRY = 30           # no new pairs in the last N ticks; all unwound before the t=285 close-out
 MIN_OPEN_QTY = 5              # don't open positions in clips smaller than this (closing is always allowed)
 STATUS_EVERY = 5              # print a status line every N ticks
