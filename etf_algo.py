@@ -71,6 +71,12 @@ PATIENT_BASKET = int(os.environ.get("PATIENT_BASKET", "10000"))         # + hedg
 PATIENT_PASSIVE = int(os.environ.get("PATIENT_PASSIVE", "0"))   # >0: also rest this many RITC 1c inside the spread
                               # while unwinding (sells at the ask + rebate instead of hitting the bid + fee). Replay of
                               # 19 real heats: about +4k/heat, worst heat +6k instead of ~0. 0 = off (default)
+PATIENT_ROUTE_MARGIN = float(os.environ.get("PATIENT_ROUTE_MARGIN", "0.03"))  # each tick unwind through the book that
+                              # pays more right now (RITC vs BULL+BEAR); use the other one too only if it is within this
+                              # (CAD/sh). Replay of 19 real heats: about +25-30k/heat vs +10-16k splitting evenly
+PATIENT_PAIR_COST = 0.03      # CAD/sh we charge a BULL+BEAR slice for the pair it leaves (closed later by the arb)
+PATIENT_HOLD_COST = float(os.environ.get("PATIENT_HOLD_COST", "0.06"))  # make room for a good tender by unwinding
+                              # pairs in the market at most this much per share (never with converters)
 PATIENT_TICKS = int(os.environ.get("PATIENT_TICKS", "30"))
 PATIENT_STOP = float(os.environ.get("PATIENT_STOP", "0.20"))         # USD/sh against us -> hedge the rest
 PATIENT_CUTOFF = int(os.environ.get("PATIENT_CUTOFF", "50"))         # no patient tender this close to the end
@@ -664,31 +670,44 @@ def patient_route(snap, tick):
         ST.ritc_plan = 0
         ST.patient = None
         return
-    # 1) RITC: the best price only, up to PATIENT_PER_TICK
-    qty = int(min(abs(ST.ritc_plan), PATIENT_PER_TICK, best_sz, MAX_EQ_ORDER))
-    if qty >= HEDGE_MIN:
-        f = market("RITC", side, qty, snap["pos"].get("RITC", 0))
-        if f:
-            ST.ritc_plan += f if side == "SELL" else -f
-            a = ST.arb_acc.setdefault(f"TENDER patient: {side.lower()} RITC", [0, 0])
-            a[1] = (a[1] * a[0] + worse * f) / (a[0] + f)   # average USD/sh vs the tender price (the "edge" column)
-            a[0] += f
-    # 2) BULL+BEAR: hedge another slice at their best prices only (a hedged pair; the arb closes pairs later)
-    if PATIENT_BASKET and abs(ST.ritc_plan) >= HEDGE_MIN and not busy("BULL", "BEAR"):
-        leg_side = side                               # long RITC tender -> SELL the legs too, and vice versa
-        lv = {l: snap["books"][l]["bids" if leg_side == "SELL" else "asks"] for l in ("BULL", "BEAR")}
-        if lv["BULL"] and lv["BEAR"]:
+    # Each tick: value per share of each way out right now, vs the tender price (CAD): back into RITC at its best price,
+    # or hedge with BULL+BEAR at their best prices (leaves a pair the arb closes later: PATIENT_PAIR_COST). Take the
+    # better first, the other only if it is within PATIENT_ROUTE_MARGIN. Other teams unwinding the same tender push one
+    # book; this sends us to the other one.
+    u = sum(snap["q"]["USD"]) / 2 or 1.0
+    sg = P["sgn"]
+    leg_side = side                               # long RITC tender -> SELL the legs too, and vice versa
+    lv = {l: (snap["books"].get(l) or {}).get("bids" if leg_side == "SELL" else "asks") or [] for l in ("BULL", "BEAR")}
+    routes = [("RITC", sg * (best_px - P["px"]) * u - FEE)]
+    if PATIENT_BASKET and lv["BULL"] and lv["BEAR"]:
+        routes.append(("BASKET", sg * (lv["BULL"][0][0] + lv["BEAR"][0][0] - P["px"] * u) - 2 * FEE - PATIENT_PAIR_COST))
+    routes.sort(key=lambda x: -x[1])
+    top = routes[0][1]
+    for name, val in routes:
+        if val < top - PATIENT_ROUTE_MARGIN - 1e-9 or abs(ST.ritc_plan) < HEDGE_MIN:
+            continue
+        if name == "RITC":
+            qty = int(min(abs(ST.ritc_plan), PATIENT_PER_TICK, best_sz, MAX_EQ_ORDER))
+            if qty >= HEDGE_MIN:
+                f = market("RITC", side, qty, snap["pos"].get("RITC", 0))
+                if f:
+                    ST.ritc_plan += f if side == "SELL" else -f
+                    a = ST.arb_acc.setdefault(f"TENDER patient: {side.lower()} RITC", [0, 0])
+                    a[1] = (a[1] * a[0] + worse * f) / (a[0] + f)   # average USD/sh vs the tender price
+                    a[0] += f
+        elif not busy("BULL", "BEAR"):
             y = int(min(abs(ST.ritc_plan), PATIENT_BASKET, lv["BULL"][0][1], lv["BEAR"][0][1], MAX_EQ_ORDER))
             if y >= HEDGE_MIN:
                 pos = snap["pos"]
                 f1 = market("BULL", leg_side, y, pos.get("BULL", 0))
                 f2 = market("BEAR", leg_side, y, pos.get("BEAR", 0)) if f1 else 0
-                done = min(f1, f2)                    # an uneven pair is evened out by the normal hedge
+                done = min(f1, f2)                # an uneven pair is evened out by the normal hedge
                 if done:
                     ST.ritc_plan += done if side == "SELL" else -done
                     if "bd" in P:
                         P["bd"] += done
                     a = ST.arb_acc.setdefault(f"TENDER patient: {leg_side.lower()} BULL+BEAR", [0, 0])
+                    a[1] = (a[1] * a[0] + val * done) / (a[0] + done)   # average CAD/sh vs the tender price
                     a[0] += done
     if abs(ST.ritc_plan) < HEDGE_MIN:
         event(tick, "PATIENT", f"done: whole tender unwound in {tick - P['t0']} ticks")
@@ -827,13 +846,14 @@ def handle_tenders(snap, tick):
         shadow_register(t, snap, why, edge)
         q, act, px = t["quantity"], t["action"], t.get("price")
         desc = f"{act:<4} {q:>6,} RITC @ {px if px is not None else 'auction'}"
-        if (not PATIENT and why.startswith("limits") and t.get("is_fixed_bid", True) and not ST.pending
+        if (why.startswith("limits") and t.get("is_fixed_bid", True) and not ST.pending
                 and edge >= max(TENDER_MIN_EDGE, HOLD_MIN_EDGE) and edge * q >= TENDER_MIN_PROFIT
                 and snap.get("ticks", 300) - tick >= cutoff
                 and tick < int(t.get("expires", tick + 6)) - 1):
             ST.pending = {"t": t, "deadline": int(t.get("expires", tick + 6)) - 1}
             need = pending_need(snap)
-            ST.pending["max_cost"] = min(PENDING_MAX_COST, PENDING_SHARE * edge * q / need) if need else 0.0
+            ST.pending["max_cost"] = min(PATIENT_HOLD_COST if PATIENT else PENDING_MAX_COST,
+                                         PENDING_SHARE * edge * q / need) if need else 0.0
             event(tick, "TENDER", f"HOLD    {desc}  edge if it fits {edge:+.3f}/sh = ${edge * q:,.0f}: "
                                   f"unwinding pairs to make room ({why.split(';')[0]})")
             shadow_note(tick, t, s_edge, s_take, edge, why)
@@ -1314,7 +1334,7 @@ def converters(snap, tick):
         # (practice heat Nov 21 09:00: 5 room conversions = 7.5k USD, turning +2.8k into -4.7k)
         need = max(need, math.ceil(max(0.0, abs(r) - ROOM_CONVERT_ABOVE) / CONVERT_BLOCK))
     p_need = pending_need(snap)
-    if p_need >= CONVERT_BLOCK / 2:
+    if p_need >= CONVERT_BLOCK / 2 and not PATIENT:
         # help a pending tender fit, but only when the market can't unwind pairs at an acceptable cost right now:
         # a conversion locks the ETF tickers for 2-3 ticks, and the market does 10k in one loop
         side = -1 if r > 0 else 1

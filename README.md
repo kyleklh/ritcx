@@ -201,6 +201,10 @@ Batch test, 6 heats at 5x speed:
    `PATIENT_TICKS` (30) hand the rest to the normal hedge; no unwinding pairs at a loss to make room in this mode.
    Replay of 10 real heats (Nov 20), one tender at a time, pair closing cost 0.03-0.08: +11k to +15k/heat,
    positive in 8-10 of 10 heats, worst about -2k. Log lines: `PATIENT | done ...`, `PATIENT | stop-loss ...`.
+   Each tick the unwind goes through the book that pays more right now (RITC vs BULL+BEAR; the other too only if within
+   `PATIENT_ROUTE_MARGIN` 0.03): other teams unwinding the same tender push one book, and this sends us to the other.
+   Replay of 19 real heats: about +25-30k/heat vs +10-16k splitting evenly. A good tender that doesn't fit the limits is
+   held while pairs are unwound in the market at most `PATIENT_HOLD_COST` (0.06/sh), never with converters.
    Optional `PATIENT_PASSIVE=10000`: while unwinding, also rest 10k RITC 1 cent inside the spread on our side (sells at
    the ask and earns the rebate instead of hitting the bid and paying the fee). Off by default; replay estimate +4k/heat.
 
