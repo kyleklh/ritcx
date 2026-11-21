@@ -68,6 +68,9 @@ PATIENT = TENDER_MODE == "patient"
 PATIENT_MIN_EDGE = float(os.environ.get("PATIENT_MIN_EDGE", "0.05"))   # CAD/sh vs the worse of basket and RITC mid
 PATIENT_PER_TICK = int(os.environ.get("PATIENT_PER_TICK", "10000"))      # RITC sold back per tick (best price only)
 PATIENT_BASKET = int(os.environ.get("PATIENT_BASKET", "10000"))         # + hedged per tick with BULL+BEAR best prices
+PATIENT_PASSIVE = int(os.environ.get("PATIENT_PASSIVE", "0"))   # >0: also rest this many RITC 1c inside the spread
+                              # while unwinding (sells at the ask + rebate instead of hitting the bid + fee). Replay of
+                              # 19 real heats: about +4k/heat, worst heat +6k instead of ~0. 0 = off (default)
 PATIENT_TICKS = int(os.environ.get("PATIENT_TICKS", "30"))
 PATIENT_STOP = float(os.environ.get("PATIENT_STOP", "0.20"))         # USD/sh against us -> hedge the rest
 PATIENT_CUTOFF = int(os.environ.get("PATIENT_CUTOFF", "50"))         # no patient tender this close to the end
@@ -584,9 +587,57 @@ def ritc_route(snap, tick):
 def patient_hand_over(tick, why):
     """Stop the patient unwind: whatever is left gets hedged with BULL+BEAR at market (fast mode) from now on."""
     event(tick, "PATIENT", f"{why}: hedging the {abs(ST.ritc_plan):,.0f} RITC left with BULL+BEAR")
+    patient_cancel_passive()
     ST.ritc_plan = 0
     ST.patient = None
     ST.fast_until = tick + FAST_TICKS
+
+
+def patient_cancel_passive():
+    P = ST.patient
+    if P and P.get("oid") is not None:
+        r = _req("DELETE", f"/orders/{P['oid']}")
+        if r is not None and r.ok:
+            P["oid"] = None
+
+
+def patient_sync(snap):
+    """RITC still to unwind, from the actual RITC position: market sales and passive fills count alike, and a late
+    position update can't make the hedge trade the wrong amount (target = existing pairs + basket slices done)."""
+    P = ST.patient
+    if "base" not in P:
+        return
+    r = effective_pos(snap).get("RITC", 0)
+    sold = P["q"] - P["sgn"] * (r - P["base"])
+    rem = max(0.0, P["q"] - sold - P["bd"])
+    ST.ritc_plan = -P["sgn"] * rem
+
+
+def patient_passive(snap, tick, side):
+    """Keep one resting RITC order 1 cent inside the other traders' spread on the side we unwind."""
+    P = ST.patient
+    if not PATIENT_PASSIVE or "base" not in P:
+        return
+    bk = snap["books"]["RITC"]
+    ob, oa = (bk["bids"][0][0] if bk["bids"] else None), (bk["asks"][0][0] if bk["asks"] else None)
+    want = None
+    if ob and oa and oa - ob > 0.025:
+        px = round(oa - 0.01, 2) if side == "SELL" else round(ob + 0.01, 2)
+        size = int(min(abs(ST.ritc_plan), PATIENT_PASSIVE, MAX_EQ_ORDER))
+        if size >= HEDGE_MIN:
+            want = (px, size)
+    if P.get("oid") is not None and (want is None or abs(P["opx"] - want[0]) > 1e-9 or P["osz"] > abs(ST.ritc_plan)):
+        r = _req("DELETE", f"/orders/{P['oid']}")
+        if r is None or not r.ok:
+            return                                    # still resting: try again next tick, don't stack another
+        P["oid"] = None
+    if want and P.get("oid") is None:
+        r = _req("POST", "/orders", ticker="RITC", type="LIMIT", quantity=want[1], action=side, price=f"{want[0]:.2f}")
+        if r is not None and r.ok:
+            try:
+                P["oid"], P["opx"], P["osz"] = r.json().get("order_id"), want[0], want[1]
+            except ValueError:
+                pass
 
 
 def patient_route(snap, tick):
@@ -596,7 +647,8 @@ def patient_route(snap, tick):
     if ST.route_tick == tick or busy("RITC") or not quotes_ok(snap["q"]):
         return
     ST.route_tick = tick
-    side = "SELL" if ST.ritc_plan < 0 else "BUY"
+    patient_sync(snap)
+    side = "SELL" if P["sgn"] > 0 else "BUY"
     levels = snap["books"]["RITC"]["bids" if side == "SELL" else "asks"]   # other traders only (ours filtered)
     if not levels:
         return
@@ -607,6 +659,8 @@ def patient_route(snap, tick):
     if tick > ST.plan_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS + 5:
         return patient_hand_over(tick, "time limit")
     if abs(ST.ritc_plan) < HEDGE_MIN:                 # a few shares left: let the hedge take them
+        event(tick, "PATIENT", f"done: whole tender unwound in {tick - P['t0']} ticks")
+        patient_cancel_passive()
         ST.ritc_plan = 0
         ST.patient = None
         return
@@ -632,12 +686,17 @@ def patient_route(snap, tick):
                 done = min(f1, f2)                    # an uneven pair is evened out by the normal hedge
                 if done:
                     ST.ritc_plan += done if side == "SELL" else -done
+                    if "bd" in P:
+                        P["bd"] += done
                     a = ST.arb_acc.setdefault(f"TENDER patient: {leg_side.lower()} BULL+BEAR", [0, 0])
                     a[0] += done
     if abs(ST.ritc_plan) < HEDGE_MIN:
         event(tick, "PATIENT", f"done: whole tender unwound in {tick - P['t0']} ticks")
+        patient_cancel_passive()
         ST.ritc_plan = 0
         ST.patient = None
+    else:
+        patient_passive(snap, tick, side)
 
 
 def shadow_register(t, snap, why, edge):
@@ -700,7 +759,9 @@ def _accept_fixed(t, snap, tick):
         note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
         plan_ritc_route(act, tick)
         if PATIENT:
-            ST.patient = {"px": float(t["price"]), "sgn": 1 if act == "BUY" else -1, "t0": tick}
+            ST.patient = {"px": float(t["price"]), "sgn": 1 if act == "BUY" else -1, "t0": tick, "q": int(q),
+                          "base": effective_pos(snap).get("RITC", 0) - (q if act == "BUY" else -q), "bd": 0,
+                          "oid": None, "opx": None}
             ST.last_tender_tick = tick
         else:
             ST.fast_until, ST.last_tender_tick = tick + FAST_TICKS, tick
@@ -1239,7 +1300,7 @@ def converters(snap, tick):
     """Redeem/create one hedged 10k block at a time while the fully hedged book doesn't fit in our limits.
     Automatic through the lease API when allowed (AUTO_CONVERT); otherwise prompts you to click."""
     ticks_total = snap.get("ticks", 300)
-    if tick < ST.conv_busy_until or tick > ticks_total - CONVERT_STOP_BEFORE_END:
+    if tick < ST.conv_busy_until or tick > ticks_total - CONVERT_STOP_BEFORE_END or ST.patient:
         return
     if busy("RITC", "BULL", "BEAR"):
         return                                       # wait for fills/conversions to show first
@@ -1338,7 +1399,9 @@ def main():
         + (", ".join(f"{k}={os.environ.get(k)}" for k in shown) or "no settings in it (all defaults)"))
     say(f"[trader id] {ST.my_id}  | market making {'ON' if MM_ON else 'off'} (+-{MM_EDGE:.2f} USD, max {MM_MAX:,})")
     say(f"[tenders] " + (f"PATIENT: take if >= {PATIENT_MIN_EDGE:.2f}/sh better than basket AND RITC, unwind "
-                         f"{PATIENT_PER_TICK:,} RITC + {PATIENT_BASKET:,} BULL/BEAR per tick at best prices, stop {PATIENT_STOP:.2f} USD, {PATIENT_TICKS} ticks max"
+                         f"{PATIENT_PER_TICK:,} RITC + {PATIENT_BASKET:,} BULL/BEAR per tick at best prices"
+                         + (f" + {PATIENT_PASSIVE:,} resting 1c inside the spread" if PATIENT_PASSIVE else "")
+                         + f", stop {PATIENT_STOP:.2f} USD, {PATIENT_TICKS} ticks max"
                          if PATIENT else f"hedge mode: min edge {TENDER_MIN_EDGE:.2f}, hedge cost {TENDER_HEDGE_COST:.2f}"))
     while not ST.quit:
         case = get("/case")
