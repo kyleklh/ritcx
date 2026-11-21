@@ -183,12 +183,14 @@ Batch test, 6 heats at 5x speed:
    To always click yourself: `$env:AUTO_CONVERT="0"; python etf_algo.py`.
 
 9. **Patient tender mode** (`TENDER_MODE=patient` in `.env`, off by default): take a tender only if its price beats
-   BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.10 CAD/sh), then sell it back into the RITC book
-   at most `PATIENT_PER_TICK` (5,000) a tick at the best price, instead of hedging it all at once with BULL+BEAR
-   (which costs 0.2-0.4/sh on the real books). If RITC moves `PATIENT_STOP` (0.20 USD) past the tender price against
-   us, or after `PATIENT_TICKS` (40), the rest is hedged with BULL+BEAR at market. Market making and arb pause while
-   a tender is being worked. Replay of 10 real heats (Nov 20), one tender at a time: about +18k/heat from tenders,
-   9 of 10 heats positive, worst about 0. Log lines: `PATIENT | done ...`, `PATIENT | stop-loss ...`.
+   BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.10 CAD/sh). Then unwind it at the best prices
+   only, in all three books at once: each tick up to `PATIENT_PER_TICK` (10,000) back into RITC plus up to
+   `PATIENT_BASKET` (10,000) hedged with BULL+BEAR (a hedged pair the arb closes later). That is flat in about 4-9
+   ticks without walking deep into any book (the instant hedge costs 0.2-0.4/sh) and without the long unhedged
+   exposure of selling through RITC alone (which lost 41k in heat 27). Stop-loss `PATIENT_STOP` (0.20 USD) and
+   `PATIENT_TICKS` (30) hand the rest to the normal hedge; no unwinding pairs at a loss to make room in this mode.
+   Replay of 10 real heats (Nov 20), one tender at a time, pair closing cost 0.03-0.08: +11k to +15k/heat,
+   positive in 8-10 of 10 heats, worst about -2k. Log lines: `PATIENT | done ...`, `PATIENT | stop-loss ...`.
 
 ### Operator during the heat
 
