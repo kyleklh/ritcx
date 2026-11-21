@@ -65,7 +65,9 @@ def run_batch(jobs, tick, loop_sleep):
     for label, heat, code, port, srv in procs:
         wd = tempfile.mkdtemp(prefix="replay_")
         wds.append(wd)
-        env = dict(os.environ, VOL_LOG_DIR=os.path.join(wd, "logs"), RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
+        # Replays already have the input quotes; polling and recording the market again overloads
+        # the local mock server and makes the strategy miss ticks, especially in parallel runs.
+        env = dict(os.environ, VOL_LOG_DIR=os.path.join(wd, "logs"), VOL_MARKET_LOG="0", RIT_API=f"http://127.0.0.1:{port}/v1", RIT_API_KEY="Rotman", LOOP_SLEEP=str(loop_sleep))
         algos.append(subprocess.Popen([sys.executable, os.path.join(code, "vol_algo.py")], cwd=wd, env=env,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     out = []

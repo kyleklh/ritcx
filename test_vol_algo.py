@@ -51,6 +51,13 @@ class TradeOptionsTest(unittest.TestCase):
         net_room = va.MAX_NET_CONTRACTS - 450          # book is short 450 already
         self.assertEqual(self.sold("RTM49C"), min(100 * va.MAX_ORDERS_PER_LOOP, net_room))
 
+    def test_gross_room_uses_combined_position(self):
+        info = make_info({"RTM48C": {"pos": 0, "pos_total": 1200},
+                          "RTM48P": {"pos": 0, "pos_total": -1200},
+                          "RTM50C": {"pos": -100, "pos_total": 100, "buy_edge": 0.5}})
+        va.trade_options(info, 50, gcap=1e9)
+        self.assertFalse(self.orders)
+
 
 class EmptyQuoteTest(unittest.TestCase):
     def test_option_with_no_ask_is_not_a_buy(self):
@@ -109,6 +116,7 @@ class GammaTrimTest(unittest.TestCase):
         va.trim_gamma(info, 230, 1000)
         self.assertEqual(self.sold("RTM50C"), 0)
         self.assertEqual(self.sold("RTM48C"), 40)
+        self.assertEqual(info["RTM48C"]["pos_total"], 0)
 
     def test_past_hard_cap_trims_back_to_it(self):
         info = make_info({"RTM50C": dict(pos=100, **self.RICH), "RTM50P": dict(pos=100, **self.RICH)})  # 2.0 caps
@@ -204,6 +212,22 @@ class StrikeArbTest(unittest.TestCase):
         self.assertIsNone(va.ST.arb)
         self.assertFalse(any(va.ST.arb_pos.values()))
         self.assertEqual(self.net_of(), 0)
+
+    def test_missing_iv_does_not_signal_convergence(self):
+        va.arb_step(self.info({49: 0.20, 51: 0.30}), 10, self.S, self.T)
+        self.orders.clear()
+        info = self.info({49: 0.20, 51: 0.30})
+        info["RTM49C"]["iv"] = None
+        va.arb_step(info, 11, self.S, self.T)
+        self.assertIsNotNone(va.ST.arb)
+        self.assertEqual(self.orders, [])
+
+    def test_basket_does_not_submit_zero_price(self):
+        info = self.info({})
+        info["RTM49C"]["bid"] = 0
+        info["RTM51C"]["ask"] = 0
+        va.arb_orders(info, 10, {"RTM51C": 100}, {"RTM49C": 100})
+        self.assertEqual(self.orders, [])
 
 
 class EngineStuckTest(unittest.TestCase):
