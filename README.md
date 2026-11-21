@@ -125,7 +125,7 @@ Batch test, 6 heats at 5x speed:
    (RITC counts 2x), so a 90k tender needs 360k of gross: more than the 300k limit. The algo therefore:
    - accepts if it can hold the tender before hedging (usage under `LIMIT_TRANSIENT_MAX`),
    - hedges with BULL and BEAR as far as the gross limit allows (`HEDGE_USAGE_MAX`),
-   - redeems/creates hedged 10k blocks to free room for the rest (see 5),
+   - prompts the operator to redeem/create hedged 10k blocks manually to free room for the rest,
    - counts the converter fees ($1,500 USD per block) and a penalty for the part that waits unhedged
      (`UNHEDGED_PENALTY`) in the tender's edge. It accepts if the edge is at least `TENDER_MIN_EDGE` per share.
    - Auction tenders get a bid priced to keep that edge.
@@ -133,9 +133,9 @@ Batch test, 6 heats at 5x speed:
    - For `FAST_TICKS` after taking a tender (and in the last `FLATTEN_TICKS`): the whole gap at market, once
      per tick, everything within `FAST_SLIP` (0.03) of that tick's best price, 10k clips alternating BULL/BEAR,
      no resting orders. Replaying the Nov 16 real books: this cost ~0.18/sh; walking to 0.15 at once cost ~0.26.
-   - Tenders are valued with that measured cost (`TENDER_HEDGE_COST`, 0.15 CAD/sh incl. fees; measured 0.13-0.18) instead of a book
-     walk: accept when tender vs basket mid beats it by `TENDER_MIN_EDGE` (so roughly 0.20-0.25+ over the basket).
-   - Otherwise: limit orders at the best price first (earning the $0.01 rebate), market orders only for the
+   - Tenders are valued using the more conservative of the measured cost (`TENDER_HEDGE_COST`) and a depth-based
+     estimate. `TENDER_BOOK_PRICING=0` restores the old fixed-cost estimate.
+   - Otherwise: limit orders at the best price first (earning the case's $0.03/share rebate), market orders only for the
      part of the gap beyond `URGENT_GAP`.
    - A resting order on a leg is cancelled before market-trading it (a late-filling resting bid overshot the
      hedge by ~10k in the real heats).
@@ -157,6 +157,9 @@ Batch test, 6 heats at 5x speed:
    It depends on speed: acting a full tick late loses money. When a good tender doesn't fit because of these pairs,
    the algo HOLDs it, unwinds just enough same-direction pairs (spending up to 60% of the tender's edge; converters
    when the market is too expensive) and accepts it within its 6 ticks.
+   `ETF_ADAPTIVE_ARB=1` enables an experimental extra opening buffer for thin liquidity, inventory, recent basket
+   movement, and time remaining. It is off by default because a saved-snapshot comparison showed fewer signals,
+   not proven higher profit. The prior realized-edge guard remains active.
 9. **Limit room**: pairs left from a tender are unwound at up to `ROOM_UNWIND_EDGE` down to `ROOM_TARGET`; if
    they're still above `ROOM_CONVERT_ABOVE` `ROOM_CONVERT_AFTER` ticks after the tender, hedged 10k blocks are
    converted so the next tender fits (Nov 16: ~$44k of tenders declined on limits).
@@ -172,15 +175,13 @@ Batch test, 6 heats at 5x speed:
 8. **Competition**: `CROWD_SHARE` (default 0.5) assumes other teams take half of the visible book, so tenders are
    only accepted if they still pay when everyone hedges at once. Use `CROWD_SHARE=1.0` to value as if alone.
    Test with competitors on the mock: `MOCK_ARGS="--crowd 3" ./test_etf_batch.sh 8 201`.
-6. **Late fills**: the real server can show a fill in `/securities` a moment after the order returns. After a
-   market order the algo does not trade that ticker again until the fill shows (or `INFLIGHT_TIMEOUT` passes),
-   and it resizes resting orders and the FX hedge once per tick. Without this, a slow server makes the hedges
-   re-send and flip-flop (2.5M USD orders back and forth). Test it with `MOCK_ARGS="--pos-lag 0.15" ./test_etf_batch.sh`.
-5. **Converters (automatic)**: the organizers confirmed the algo may use the converters through the API (the case PDF still says human-only). While the fully
-   hedged book would not fit under `CONVERT_TARGET` usage, the algo leases ETF-Redemption / ETF-Creation and uses
-   them one 10k block at a time through the RIT API (`CONVERT` lines in the log). If the server refuses, it prints
-   `CONVERTER API NOT AVAILABLE` and switches to `>>> CONVERTER ... NOW` prompts for you to click.
-   To always click yourself: `$env:AUTO_CONVERT="0"; python etf_algo.py`.
+6. **Late fills**: after a market order the algo waits for `/securities` to show the fill. If it remains unseen
+   beyond `INFLIGHT_TIMEOUT`, it raises a `RISK` warning and blocks further orders for that ticker for the heat;
+   inspect the client's positions and open orders. It does not assume that a timeout means no fill occurred.
+5. **Converters (manual only)**: the algo never leases or uses converters via the API, regardless of environment
+   settings. It prompts the operator when a hedged block needs conversion and alerts when converting an existing
+   hedged block appears cheaper than closing it in the market after the USD $1,500 fee. Quotes can change; verify
+   positions, prices, available assets, and case rules in the client before clicking.
 
 9. **Patient tender mode** (`TENDER_MODE=patient` in `.env`, off by default): take a tender only if its price beats
    BOTH the basket mid and RITC's own mid by `PATIENT_MIN_EDGE` (0.10 CAD/sh). Then unwind it at the best prices
@@ -194,8 +195,11 @@ Batch test, 6 heats at 5x speed:
 
 ### Operator during the heat
 
-- The algo converts by itself. If you see `CONVERTER API NOT AVAILABLE`, click Use on the converter named in each
-  `>>> CONVERTER` prompt (10,000 per click); the prompt repeats every few ticks while more blocks are needed.
+- Conversion is manual. Follow `>>> CONVERTER` prompts in the client; prompts repeat while blocks remain needed.
+- An unknown order outcome blocks further orders for that ticker for the heat: inspect the client immediately.
+- By default, the algo checks that the simulation tick has not changed while gathering quotes and books. If it
+  has changed, it refreshes before submitting decisions. `ETF_REQUIRE_FRESH_TICK=0` restores previous timing but
+  permits decisions on older snapshots.
 - Watch `limits=` and check that BULL and BEAR stay equal to -RITC.
 - `p` / `r` to pause / resume tenders and arb (hedging continues). `s` for status, `q` to quit.
 

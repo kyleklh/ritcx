@@ -14,13 +14,8 @@ converges for free at the end. Profit comes from the price at which we enter the
   4. FX: RITC settles in USD, so keep the USD cash position near 0 with the USD ticker.
   6. ROOM + END: shrink pairs left from a tender (market, then converters) so the next tender fits, and
      flatten everything before the close-out.
-  5. CONVERTERS: tenders (70k-100k RITC) are too big to hedge with stock alone, because a hedged
-     share uses 4 units of gross (RITC counts 2x). So we accept the tender, hedge what fits, and
-     redeem/create hedged 10k blocks: each block cancels RITC against BULL+BEAR and frees 40k of
-     gross for the next part of the hedge. The case PDF says converters are human-only, but the organizers
-     confirmed the algo may use them through the API: it leases ETF-Redemption / ETF-Creation and converts
-     one 10k block at a time. If the server refuses, it falls back to printing
-     ">>> CONVERTER: REDEEM 1 x 10,000 NOW" prompts for you to click in the RIT Client Assets tab.
+  5. CONVERTERS: manual only. The algo alerts the operator when a hedged 10,000-share block
+     may need conversion, or when conversion appears cheaper than trading out of that block.
 
 Live commands (type + Enter):  p / r  pause / resume tenders+arb (hedging continues)
                                s      status        q  quit
@@ -57,6 +52,7 @@ TENDER_MIN_EDGE = float(os.environ.get("TENDER_MIN_EDGE", "0.05"))        # CAD/
 # Across all 48 logged tenders (Nov 16 heats + 2 solo practices): 0.18 took 8 (all winners, +$153k), 0.15 took
 # 11 (all winners, +$177k), 0.13 took 12 (+$180k), 0.10 took 13 incl. a loser. 0.15 keeps a margin over 0.13.
 TENDER_HEDGE_COST = float(os.environ.get("TENDER_HEDGE_COST", "0.15"))
+TENDER_BOOK_PRICING = os.environ.get("TENDER_BOOK_PRICING", "1") == "1"  # 0 restores the fixed-cost model
 # Patient tender mode (TENDER_MODE=patient in .env; default "hedge" = the original behaviour). Take a tender when its
 # price beats BOTH the basket mid and RITC's own mid by PATIENT_MIN_EDGE, and sell it back slowly into the RITC book
 # (PATIENT_PER_TICK a tick, at the best price only) instead of hedging it at once with BULL+BEAR, which costs
@@ -130,6 +126,7 @@ ARB_GUARD_MIN = 0.02
 ARB_GUARD_OK = 0.06
 ARB_GUARD_STEP = 0.05
 ARB_GUARD_MAX = 0.30
+ADAPTIVE_ARB = os.environ.get("ETF_ADAPTIVE_ARB", "0") == "1"  # experimental; 0 keeps the previous threshold
 HOLD_MIN_EDGE = 0.15          # only tenders this good are worth paying to make room for (practice: two HOLDs at
                               # 0.09-0.11 cost ~2.2k of unwinding and the edge was gone 2 ticks later)
 # Market making in RITC (MM_ON=1, default): resting bid at fair-MM_EDGE and ask at fair+MM_EDGE (fair = basket/USD),
@@ -161,7 +158,7 @@ ROOM_CONVERT_ABOVE = 30000    # ...convert hedged 10k blocks while |RITC| is abo
 # into the close are a coin flip (heat 4: -7k in the last 5 ticks). Flatten instead.
 NO_OPEN_TICKS = 30            # no new arb pairs in the last N ticks
 FLATTEN_TICKS = 20            # in the last N ticks, unwind every pair at up to FLATTEN_EDGE...
-FLATTEN_EDGE = -0.12
+FLATTEN_EDGE = float(os.environ.get("FLATTEN_EDGE", "-0.12"))  # experiment only: net CAD/share allowed for forced exits
 QUIET_TICKS = 2               # ...and in the last N ticks trade nothing but hedge gaps
 TENDER_CUTOFF_TICKS = 35      # decline tenders this close to the end: no time to hedge and unwind them
 
@@ -175,9 +172,8 @@ CONVERT_TICKS = 2                 # one use takes this many ticks; one use at a 
 CONVERT_TARGET = 0.90             # convert hedged blocks until the fully hedged book fits under this usage
 CONVERT_STOP_BEFORE_END = 5       # no new conversions in the last N ticks
 # Converters: the case PDF says human-only, but the organizers confirmed API use is allowed.
-# AUTO_CONVERT=1 (default): the algo leases and uses them through the RIT API (/leases). If the server
-# refuses, it falls back to printing prompts for you to click. AUTO_CONVERT=0: prompts only.
-AUTO_CONVERT = os.environ.get("AUTO_CONVERT", "1") == "1"
+# Conversion is manual-only, regardless of environment settings.
+AUTO_CONVERT = False
 CONVERTER_TICKERS = {"redeem": "ETF-Redemption", "create": "ETF-Creation"}
 REPROMPT_TICKS = 4                # manual mode: repeat the prompt if nothing happened after this many ticks
 
@@ -187,6 +183,7 @@ INFLIGHT_TIMEOUT = 1.5        # seconds; after this, trade the ticker again even
 DEFAULT_GROSS, DEFAULT_NET = 300_000, 200_000   # used if /limits is unavailable
 STATUS_EVERY = 5              # print a status line every N ticks
 LOOP_SLEEP = float(os.environ.get("LOOP_SLEEP", 0.15))
+REQUIRE_FRESH_TICK = os.environ.get("ETF_REQUIRE_FRESH_TICK", "1") == "1"  # 0 restores previous timing
 # Everything from a run goes to logs/ (send the whole folder after a session):
 #   etf_<time>.txt    the terminal output
 #   etf_<time>.csv    one line per tick: positions, limit usage, P&L
@@ -250,6 +247,9 @@ class State:
     mm_stats = [0, 0.0]   # shares filled, sum of (edge vs fair at fill) * shares
     mm_hedge_until = -1   # hedge an MM fill at market until this tick
     last_tender_tick = -100
+    unknown_order_tickers = set()
+    unknown_tender = False
+    last_conversion_alert = {}
 
 
 ST = State()
@@ -257,6 +257,9 @@ ST = State()
 
 # ------------------------------- API helpers -------------------------------
 def _req(method, path, **params):
+    if method.upper() != "GET" and (path == "/leases" or path.startswith("/leases/")):
+        say("[RISK] converter API action blocked: conversion is manual-only")
+        return None
     for _ in range(5):
         try:
             r = s.request(method, f"{API}{path}", params=params, timeout=2)
@@ -269,6 +272,16 @@ def _req(method, path, **params):
             return r
         except requests.RequestException as e:
             say(f"[warn] {method} {path}: {e}")
+            if method.upper() != "GET":
+                if path == "/orders" and params.get("ticker"):
+                    ST.unknown_order_tickers.add(params["ticker"])
+                    say(f"[RISK] {params['ticker']} order outcome unknown: inspect orders and positions; trading that ticker is blocked for this heat")
+                elif method.upper() == "POST" and path.startswith("/tenders/"):
+                    ST.unknown_tender = True
+                    say("[RISK] tender acceptance outcome unknown: inspect the client; new risk is blocked for this heat")
+                else:
+                    say(f"[RISK] {method} {path} outcome unknown; inspect the client; not retrying")
+                return None
             time.sleep(0.2)
     return None
 
@@ -291,34 +304,55 @@ def note_fill(ticker, cur, signed_qty):
 
 
 def check_inflight(pos):
-    """Clear a ticker once /securities shows our fill (or after the timeout). Never edits positions."""
+    """Clear confirmed fills; an overdue fill blocks new orders until an operator checks it."""
     now = time.time()
     for tk, f in list(ST.inflight.items()):
         # cleared only when the server shows ALL our fills (orders in both directions can be pending at once)
         unseen = f["total"] - (pos.get(tk, 0) - f["base"])
-        if abs(unseen) <= max(100, 0.02 * abs(f["total"])) or now - f["t"] > INFLIGHT_TIMEOUT:
+        if abs(unseen) <= max(100, 0.02 * abs(f["total"])):
             del ST.inflight[tk]
+        elif now - f["t"] > INFLIGHT_TIMEOUT and tk not in ST.unknown_order_tickers:
+            ST.unknown_order_tickers.add(tk)
+            say(f"[RISK] {tk} fill not visible after {INFLIGHT_TIMEOUT:g}s; inspect orders and positions; trading that ticker is blocked for this heat")
 
 
 def busy(*tickers):
     if ST.now_tick < ST.conv_hold_until and any(t in ("RITC", "BULL", "BEAR") for t in tickers):
         return True       # a conversion is swapping RITC <-> BULL+BEAR right now
-    return any(t in ST.inflight for t in tickers)
+    return any(t in ST.inflight or t in ST.unknown_order_tickers for t in tickers)
 
 
 def market(ticker, action, qty, cur):
     """Market order. cur = current position (as the algo sees it), used to track the fill."""
     qty = int(qty)
-    if qty <= 0:
+    if qty <= 0 or ticker in ST.unknown_order_tickers:
         return 0
     r = _req("POST", "/orders", ticker=ticker, type="MARKET", quantity=qty, action=action)
     if r is None or not r.ok:
         say(f"[order rejected] {action} {qty} {ticker}: {r.text[:120] if r is not None else 'no response'}")
         return 0
-    j = r.json()
+    try:
+        j = r.json()
+        if not isinstance(j, dict):
+            raise ValueError("order response is not an object")
+    except ValueError:
+        ST.unknown_order_tickers.add(ticker)
+        say(f"[RISK] {ticker} order response unreadable; inspect orders and positions; trading that ticker is blocked for this heat")
+        return 0
     jlog({"type": "order", "tick": ST.now_tick, "t": round(time.time(), 3), "ticker": ticker, "action": action,
           "qty": qty, "resp": {k: j.get(k) for k in ("order_id", "status", "quantity_filled", "vwap", "price")}})
-    filled = int(j.get("quantity_filled") or 0) if j.get("status") == "TRANSACTED" else qty
+    reported = j.get("quantity_filled")
+    try:
+        filled = int(reported or 0)
+        if filled < 0 or filled > qty or (reported is not None and filled != float(reported)):
+            raise ValueError("invalid fill quantity")
+    except (TypeError, ValueError, OverflowError):
+        ST.unknown_order_tickers.add(ticker)
+        say(f"[RISK] {ticker} order fill invalid; inspect orders and positions; trading that ticker is blocked for this heat")
+        return 0
+    if reported is None or j.get("status") not in ("TRANSACTED", "CANCELLED", "CANCELED"):
+        ST.unknown_order_tickers.add(ticker)
+        say(f"[RISK] {ticker} market order not confirmed complete; inspect orders and positions; trading that ticker is blocked for this heat")
     ST.last_vwap[ticker] = float(j["vwap"]) if j.get("vwap") else None
     q_ = ST.last_quotes.get(ticker)
     if j.get("vwap") and q_ and q_[0] > 0 and ticker in ("BULL", "BEAR") and filled:
@@ -348,11 +382,11 @@ def snapshot():
                     "asks": [(float(l["price"]), int(l["quantity"]) - int(l.get("quantity_filled", 0)))
                              for l in b["asks"] if l.get("trader_id") not in ("self", ST.my_id)]}
     lim = get("/limits")
-    if lim:
-        L = lim[0]
-        gl, nl = float(L.get("gross_limit") or DEFAULT_GROSS), float(L.get("net_limit") or DEFAULT_NET)
-    else:
-        gl, nl = DEFAULT_GROSS, DEFAULT_NET
+    L = next((x for x in (lim or []) if str(x.get("name", "")).upper() == "LIMIT-STOCK"), None)
+    if not L or not L.get("gross_limit") or not L.get("net_limit"):
+        say("[RISK] stock limits unavailable; cannot safely size ETF orders")
+        return None
+    gl, nl = float(L["gross_limit"]), float(L["net_limit"])
     return {"pos": pos, "q": quotes, "books": books, "raw_books": raw_books, "gross_limit": gl, "net_limit": nl,
             "limits_raw": lim}
 
@@ -419,7 +453,16 @@ def leg_value(levels, mid, q, sgn, share=None):
     (measured on the real heats; see the setting). An empty book means something is broken: make it expensive."""
     if not levels:
         return mid + sgn * (FEE + 0.10)
-    return mid + sgn * TENDER_HEDGE_COST / 2
+    fixed = TENDER_HEDGE_COST / 2
+    if not TENDER_BOOK_PRICING or q <= 0:
+        return mid + sgn * fixed
+    available_share = CROWD_SHARE if share is None else share
+    available_share = max(0.05, min(1.0, available_share))
+    execution = walk(levels, math.ceil(q / available_share), sgn)
+    if execution is None:
+        return mid + sgn * max(fixed, FEE + 0.10)
+    observed_cost = max(0.0, sgn * (execution - mid)) + FEE
+    return mid + sgn * max(fixed, observed_cost)
 
 
 def blocks_to_convert(pos, gl, nl, d_ritc=0):
@@ -436,13 +479,23 @@ def evaluate_tender(t, snap, share=None):
     """Returns (edge_per_share_CAD, bid_price_for_auction_or_None, reason).
     Edge = tender price vs the basket we will sell/buy to hedge, minus converter fees for the blocks
     we must convert to fit the hedge in our limits, minus a penalty for the part that waits unhedged."""
-    q, act = int(t["quantity"]), t["action"]
+    try:
+        raw_qty = float(t["quantity"])
+        q, act = int(raw_qty), t["action"]
+        px = t.get("price")
+        if (not math.isfinite(raw_qty) or q <= 0 or q != raw_qty or act not in ("BUY", "SELL")
+                or t.get("ticker") != "RITC"
+                or (t.get("is_fixed_bid", True) and px is None)
+                or (px is not None and (not math.isfinite(float(px)) or float(px) <= 0))):
+            return 0.0, None, "invalid tender"
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return 0.0, None, "invalid tender"
     if not quotes_ok(snap["q"]):
         return 0.0, None, "quotes missing or broken right now"
     bk, (ub, ua) = snap["books"], snap["q"]["USD"]
     mids = {k: sum(snap["q"][k]) / 2 for k in ("BULL", "BEAR")}
     usd = (ub + ua) / 2 or 1.0
-    px = t.get("price")
+    px = float(px) if px is not None else None
     side = 1 if act == "BUY" else -1
     gl, nl = snap["gross_limit"], snap["net_limit"]
     pos = snap["pos"]
@@ -527,6 +580,11 @@ def evaluate_tender(t, snap, share=None):
 
 def still_hedging(snap):
     """Why we're not ready for another tender ('' if we are): RITC route or a big hedge gap still open."""
+    if ST.unknown_tender:
+        return "a tender acceptance outcome is unknown"
+    unknown = ST.unknown_order_tickers.intersection(("RITC", "BULL", "BEAR"))
+    if unknown:
+        return f"unknown order outcome for {', '.join(sorted(unknown))}"
     if ST.ritc_plan:
         return f"{abs(ST.ritc_plan):,.0f} RITC still going back into its book"
     pos = snap["pos"]
@@ -692,9 +750,24 @@ def shadow_update(tick):
     ST.shadow_obs = keep
 
 
+def tender_response_ok(response):
+    """Never assume an unreadable or ambiguous successful HTTP response means a tender was declined."""
+    if response is None or not response.ok:
+        return False
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("success"), bool):
+            raise ValueError("missing success flag")
+        return payload["success"]
+    except ValueError:
+        ST.unknown_tender = True
+        say("[RISK] tender response unreadable; inspect the client; new risk is blocked for this heat")
+        return False
+
+
 def _accept_fixed(t, snap, tick):
     r = _req("POST", f"/tenders/{t['tender_id']}")
-    ok = r is not None and r.ok and r.json().get("success", True)
+    ok = tender_response_ok(r)
     if ok:
         q, act = t["quantity"], t["action"]
         note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
@@ -749,6 +822,9 @@ def handle_tenders(snap, tick):
         if tid in ST.seen_tenders:
             continue
         ST.seen_tenders.add(tid)
+        if t.get("expires") is not None and tick >= t["expires"]:
+            event(tick, "TENDER", f"#{tid} ignored (expired)")
+            continue
         if ST.paused:
             event(tick, "TENDER", f"#{tid} ignored (paused)")
             continue
@@ -788,7 +864,7 @@ def handle_tenders(snap, tick):
                 return True
         elif why.startswith("auction"):
             r = _req("POST", f"/tenders/{tid}", price=f"{bid:.2f}")
-            ok = r is not None and r.ok and r.json().get("success", True)
+            ok = tender_response_ok(r)
             if ok:
                 note_fill("RITC", snap["pos"].get("RITC", 0), q if act == "BUY" else -q)
                 plan_ritc_route(act, tick)
@@ -807,7 +883,8 @@ def handle_tenders(snap, tick):
 
 # ------------------------------- 2. hedge -------------------------------
 def open_orders():
-    return get("/orders", status="OPEN") or []
+    # None means the API failed; it is not evidence that there are no resting orders.
+    return get("/orders", status="OPEN")
 
 
 def hedge(snap, tick, orders=None, passive=True):
@@ -819,6 +896,9 @@ def hedge(snap, tick, orders=None, passive=True):
     pos, bk, q = effective_pos(snap), snap["books"], snap["q"]
     target = -(pos.get("RITC", 0) + ST.ritc_plan)     # RITC still going back into its own book needs no hedge
     orders = open_orders() if orders is None else orders
+    if orders is None:
+        event(tick, "RISK", "cannot verify resting hedge orders; check positions and open orders")
+        return False
     did = False
     fast = tick <= ST.fast_until or snap.get("ticks", 300) - tick <= FLATTEN_TICKS or tick <= ST.mm_hedge_until
     slip = FAST_SLIP if fast else HEDGE_SLIP
@@ -848,8 +928,12 @@ def hedge(snap, tick, orders=None, passive=True):
             urgent = min(urgent, abs(gap) - max(0.0, abs(other) - URGENT_GAP))
         mine = [o for o in orders if o["ticker"] == leg]
         if urgent >= HEDGE_MIN and mine:
-            _req("POST", "/commands/cancel", ticker=leg)   # never market-buy on top of a resting bid
-            mine = []
+            # Cancellation and position updates can lag. Wait for a fresh snapshot before sending a
+            # market hedge, even when the cancel request succeeded, to avoid doubling a late fill.
+            response = _req("POST", "/commands/cancel", ticker=leg)
+            if response is None or not response.ok:
+                event(tick, "RISK", f"{leg} hedge cancellation unconfirmed; retrying after a fresh snapshot")
+            continue
         levels = bk[leg]["asks"] if gap > 0 else bk[leg]["bids"]
         avail = max(levels[0][1] if levels else 0, depth_within(levels, slip))
         plan[leg] = {"gap": gap, "side": side, "urgent": max(0, urgent), "avail": avail, "mine": mine}
@@ -896,7 +980,10 @@ def hedge(snap, tick, orders=None, passive=True):
         if ok:
             continue
         if mine:
-            _req("POST", "/commands/cancel", ticker=leg)
+            response = _req("POST", "/commands/cancel", ticker=leg)
+            if response is None or not response.ok:
+                event(tick, "RISK", f"{leg} hedge cancellation unconfirmed; retrying after a fresh snapshot")
+            continue  # do not stack a replacement on a cancellation that may still be in flight
         left = want_qty
         while left > 0:
             qty = min(MAX_EQ_ORDER, left)
@@ -925,9 +1012,34 @@ def pair_edge(snap, side, qty):
     bk, (ub, ua) = snap["books"], snap["q"]["USD"]
     if side < 0:
         rp, bp, ep = _vwap(bk["RITC"]["bids"], qty), _vwap(bk["BULL"]["asks"], qty), _vwap(bk["BEAR"]["asks"], qty)
-        return None if None in (rp, bp, ep) else rp * ub - bp - ep - 3 * FEE
+        return None if None in (rp, bp, ep) else rp * ub - bp - ep - FEE * (2 + ub)
     rp, bp, ep = _vwap(bk["RITC"]["asks"], qty), _vwap(bk["BULL"]["bids"], qty), _vwap(bk["BEAR"]["bids"], qty)
-    return None if None in (rp, bp, ep) else bp + ep - rp * ua - 3 * FEE
+    return None if None in (rp, bp, ep) else bp + ep - rp * ua - FEE * (2 + ua)
+
+
+def conversion_opportunity(snap, tick):
+    """Alert only when converting an already hedged block appears cheaper than closing it at market."""
+    if busy("RITC", "BULL", "BEAR") or not quotes_ok(snap["q"]):
+        return
+    pos = effective_pos(snap)
+    r = pos.get("RITC", 0)
+    if r >= CONVERT_BLOCK and pos.get("BULL", 0) <= -CONVERT_BLOCK and pos.get("BEAR", 0) <= -CONVERT_BLOCK:
+        kind, side = "redeem", -1
+    elif r <= -CONVERT_BLOCK and pos.get("BULL", 0) >= CONVERT_BLOCK and pos.get("BEAR", 0) >= CONVERT_BLOCK:
+        kind, side = "create", 1
+    else:
+        return
+    if tick - ST.last_conversion_alert.get(kind, -100) < REPROMPT_TICKS:
+        return
+    close_edge = pair_edge(snap, side, CONVERT_BLOCK)
+    if close_edge is None:
+        return
+    usd_ask = snap["q"]["USD"][1]
+    conversion_cost = CONVERT_FEE_USD * usd_ask
+    advantage = -conversion_cost - close_edge * CONVERT_BLOCK
+    if advantage > 0:
+        ST.last_conversion_alert[kind] = tick
+        event(tick, "CONVERT ALERT", f"manual {kind} 1 x {CONVERT_BLOCK:,}: estimated ${advantage:,.0f} CAD cheaper than market close after ${CONVERT_FEE_USD:,} USD fee; verify quotes and positions")
 
 
 def pair_size(snap, side, thr, cap):
@@ -941,6 +1053,26 @@ def pair_size(snap, side, thr, cap):
     return best, best_e
 
 
+def arb_open_threshold(snap, side, position, tick):
+    """Add a bounded risk buffer to the realized-edge guard; never lower the original minimum."""
+    base = ARB_OPEN_EDGE + ST.arb_extra
+    if not ADAPTIVE_ARB:
+        return base
+    books = snap["books"]
+    levels = (("RITC", "asks" if side > 0 else "bids"),
+              ("BULL", "bids" if side > 0 else "asks"),
+              ("BEAR", "bids" if side > 0 else "asks"))
+    top = min((books[tk][book][0][1] if books[tk][book] else 0) for tk, book in levels)
+    liquidity = 0.02 * max(0.0, 1.0 - top / max(1, ARB_CLIP))
+    inventory = 0.02 * min(1.0, abs(position) / max(1, ARB_MAX_PAIRS))
+    left = snap.get("ticks", 300) - tick
+    late = 0.02 * max(0.0, min(1.0, (60 - left) / 30))
+    current = ST.basket_hist.get(tick)
+    previous = ST.basket_hist.get(tick - 1)
+    volatility = min(0.02, 0.1 * abs(current - previous)) if current is not None and previous is not None else 0.0
+    return base + liquidity + inventory + late + volatility
+
+
 def trade_pair(side, qty, pos, label, edge, snap=None):
     """All three legs at market, back to back. A leg that fills short is fixed by hedge()."""
     f = market("RITC", "SELL" if side < 0 else "BUY", qty, pos.get("RITC", 0))
@@ -949,14 +1081,21 @@ def trade_pair(side, qty, pos, label, edge, snap=None):
     rp = ST.last_vwap.get("RITC")
     pos["RITC"] = pos.get("RITC", 0) + (f if side > 0 else -f)
     leg_act = "BUY" if side < 0 else "SELL"
-    vw = {}
+    vw, leg_fills = {}, {}
     for leg in ("BULL", "BEAR"):
         g = market(leg, leg_act, f, pos.get(leg, 0))
+        leg_fills[leg] = g
         vw[leg] = ST.last_vwap.get(leg) if g else None
         pos[leg] = pos.get(leg, 0) + (g if leg_act == "BUY" else -g)
-    if label == "ARB" and snap and rp and vw.get("BULL") and vw.get("BEAR"):
+    if snap and rp and vw.get("BULL") and vw.get("BEAR") and all(leg_fills.get(leg) == f for leg in ("BULL", "BEAR")):
         ub, ua = snap["q"]["USD"]
-        real = (rp * ub - vw["BULL"] - vw["BEAR"] if side < 0 else vw["BULL"] + vw["BEAR"] - rp * ua) - 3 * FEE
+        real = ((rp * ub - vw["BULL"] - vw["BEAR"] - FEE * (2 + ub)) if side < 0
+                else (vw["BULL"] + vw["BEAR"] - rp * ua - FEE * (2 + ua)))
+        jlog({"type": "pair_execution", "tick": ST.now_tick, "label": label, "side": side,
+              "quantity": f, "planned_edge": edge, "estimated_filled_edge": real})
+    else:
+        real = None
+    if label == "ARB" and real is not None:
         ST.arb_real = (ST.arb_real + [real])[-ARB_GUARD_N:]
         if len(ST.arb_real) >= ARB_GUARD_N:
             avg = sum(ST.arb_real) / len(ST.arb_real)
@@ -976,6 +1115,8 @@ def trade_pair(side, qty, pos, label, edge, snap=None):
 
 
 def arb(snap, tick):
+    if ST.unknown_tender:
+        return False
     if snap["tick"] < ST.conv_busy_until or busy("RITC", "BULL", "BEAR"):
         return False
     if ST.paused and not ST.pending:
@@ -986,8 +1127,8 @@ def arb(snap, tick):
     if not quotes_ok(q):
         return False
     ub, ua = q["USD"]
-    top_sell = q["RITC"][0] * ub - (q["BULL"][1] + q["BEAR"][1]) - 3 * FEE
-    top_buy = (q["BULL"][0] + q["BEAR"][0]) - q["RITC"][1] * ua - 3 * FEE
+    top_sell = q["RITC"][0] * ub - (q["BULL"][1] + q["BEAR"][1]) - FEE * (2 + ub)
+    top_buy = (q["BULL"][0] + q["BEAR"][0]) - q["RITC"][1] * ua - FEE * (2 + ua)
     if max(top_sell, top_buy) > MAX_SANE_EDGE:
         return False                     # a price is stale/missing (e.g. at tick 0): not a real edge
     ticks_left = snap.get("ticks", 300) - tick
@@ -1024,7 +1165,7 @@ def arb(snap, tick):
         cap = min(ARB_CLIP, ARB_MAX_PAIRS - abs(r))
         if cap < 100:
             continue
-        n, e = pair_size(snap, side, ARB_OPEN_EDGE + ST.arb_extra, cap)
+        n, e = pair_size(snap, side, arb_open_threshold(snap, side, r, tick), cap)
         if n >= 100 and usage(pos, gl, nl, d_ritc=side * n, d_bull=-side * n, d_bear=-side * n) <= LIMIT_USAGE_MAX:
             return trade_pair(side, n, pos, "ARB", e, snap) > 0
     return False
@@ -1096,7 +1237,7 @@ def mm(snap, tick, orders):
     pos = effective_pos(snap)
     r = pos.get("RITC", 0)
     gap = max(abs(pos.get(l, 0) + r) for l in ("BULL", "BEAR"))
-    stop = (fair is None or ST.paused or ST.pending or ST.ritc_plan or tick <= ST.fast_until or ticks_left <= NO_OPEN_TICKS
+    stop = (fair is None or ST.paused or ST.pending or ST.ritc_plan or ST.unknown_tender or ST.unknown_order_tickers or tick <= ST.fast_until or ticks_left <= NO_OPEN_TICKS
             or gap > URGENT_GAP or snap["tick"] < ST.conv_hold_until)
     if stop:
         if ST.mm_orders:
@@ -1141,6 +1282,8 @@ def mm(snap, tick, orders):
     live = [i for i in ST.mm_orders.values() if i["qty"] - i["filled"] > 0]
     for side in ("BUY", "SELL"):
         w = want.get(side)
+        if "RITC" in ST.unknown_order_tickers:
+            break
         if not w or side in have or w[1] < 100:
             continue
         if side == "BUY" and any(i["side"] == "SELL" and i["price"] <= w[0] + 1e-9 for i in live):
@@ -1181,63 +1324,23 @@ def effective_pos(snap):
 
 
 def _lease_id(kind):
-    """The id of our lease on this converter: looked up fresh each time (a stale id is what the server
-    rejected as 'Invalid lease id'); leases it first if we don't hold one."""
-    ticker = CONVERTER_TICKERS[kind]
-    for L in get("/leases") or []:
-        if L.get("ticker") == ticker:
-            return L.get("id")
-    r = _req("POST", "/leases", ticker=ticker)
-    if r is not None and r.ok:
-        try:
-            return r.json().get("id")
-        except ValueError:
-            return None
-    say(f"[converter] could not lease {ticker}: {r.text[:160] if r is not None else 'no response'}")
+    """Compatibility stub: converters are operated manually."""
     return None
 
 
 def _use_converter(kind):
-    """Use the converter once (10,000). Tries, in order:
-      1. POST /leases/{id}?from1=..                           (lease, then use the lease id: works on the real server)
-      2. POST /leases?ticker=ETF-...&from1=..&quantity1=..   (by ticker: refused for REFINERY assets, kept as a fallback)"""
-    ticker = CONVERTER_TICKERS[kind]
-    if kind == "redeem":
-        params = {"from1": "RITC", "quantity1": CONVERT_BLOCK, "from2": "USD", "quantity2": CONVERT_FEE_USD}
-    else:
-        params = {"from1": "BULL", "quantity1": CONVERT_BLOCK, "from2": "BEAR", "quantity2": CONVERT_BLOCK,
-                  "from3": "USD", "quantity3": CONVERT_FEE_USD}
-    lid = _lease_id(kind)
-    err2 = "no lease"
-    if lid is not None:
-        r = _req("POST", f"/leases/{lid}", **params)
-        if r is not None and r.ok:
-            jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": f"lease id {lid}", "resp": r.text[:300]})
-            return True
-        err2 = r.text[:160] if r is not None else "no response"
-    r = _req("POST", "/leases", ticker=ticker, **params)       # never worked on the real server; last resort
-    if r is not None and r.ok:
-        jlog({"type": "convert", "tick": ST.now_tick, "kind": kind, "how": "ticker", "resp": r.text[:300]})
-        return True
-    err1 = r.text[:160] if r is not None else "no response"
-    say(f"[converter] {kind} failed. by lease id {lid}: {err2} | by ticker: {err1}")
-    jlog({"type": "convert_failed", "tick": ST.now_tick, "kind": kind, "err_ticker": err1, "lease_id": lid, "err_id": err2})
+    """Compatibility stub: this program never executes conversions."""
     return False
 
 
 def lease_converters(tick):
-    """Lease both converters early in the heat: a lease made in the same tick as its first use was refused
-    ('Invalid lease id 1' at t=144 in practice, fine from t=148 on). Leases are free, one per trader each."""
-    if not AUTO_CONVERT or ST.leased or tick < 1:
-        return
-    ids = {k: _lease_id(k) for k in CONVERTER_TICKERS}
-    ST.leased = all(v is not None for v in ids.values())
-    say(f"[converter] leases: {ids}")
+    """Converters are manual-only; never lease via API."""
+    return
 
 
 def converters(snap, tick):
     """Redeem/create one hedged 10k block at a time while the fully hedged book doesn't fit in our limits.
-    Automatic through the lease API when allowed (AUTO_CONVERT); otherwise prompts you to click."""
+    Manual only: prompt the operator; never use the converter through the API."""
     ticks_total = snap.get("ticks", 300)
     if tick < ST.conv_busy_until or tick > ticks_total - CONVERT_STOP_BEFORE_END:
         return
@@ -1275,23 +1378,6 @@ def converters(snap, tick):
         return                                       # hedge the next block first
     kind = "redeem" if r > 0 else "create"
     ST.conv_prompts += 1
-    if ST.auto_convert:
-        if _use_converter(kind):
-            # while a hedge gap is open, leave a couple of ticks between conversions for the hedge to trade
-            # (a conversion locks the ETF tickers; back to back they starved the hedge for ~15 ticks on the mock)
-            gap_open = any(abs(pos.get(l, 0) + r) >= HEDGE_MIN for l in ("BULL", "BEAR"))
-            ST.conv_busy_until = tick + CONVERT_TICKS + (2 if gap_open else 0)
-            ST.conv_hold_until = tick + CONVERT_TICKS + 1
-            event(tick, "CONVERT", f"{kind.upper()} 1 x 10,000 (#{ST.conv_prompts}, fee ${CONVERT_FEE_USD:,} USD)"
-                                   f"  [{need} block{'s' if need > 1 else ''} needed]")
-            return
-        ST.convert_failures += 1
-        if ST.convert_failures >= 3:
-            ST.auto_convert = False
-            banner("CONVERTER API FAILED 3 TIMES: switching to prompts for this heat.\n"
-                   "Click ETF-Redemption / ETF-Creation in the RIT Client Assets tab when asked.")
-        else:
-            say(f"[converter] API attempt {ST.convert_failures}/3 failed; click this one, will retry the API next time")
     banner(f">>> CONVERTER: {kind.upper()} 1 x 10,000 NOW  (Assets tab -> {CONVERTER_TICKERS[kind]})"
            f"   [{need} block{'s' if need > 1 else ''} still needed]")
     ST.conv_busy_until = tick + REPROMPT_TICKS
@@ -1355,6 +1441,8 @@ def main():
             ST.pending = None
             ST.arb_real, ST.arb_extra = [], 0.0
             ST.mm_orders, ST.mm_stats, ST.mm_hedge_until = {}, [0, 0.0], -1
+            ST.unknown_order_tickers, ST.last_conversion_alert = set(), {}
+            ST.unknown_tender = False
         if tick != ST.flush_tick:
             for what, (qty, edge) in ST.arb_acc.items():
                 event(ST.flush_tick, "ARB", f"{what}: {qty:,} shares, edge {edge:+.3f}/sh")
@@ -1368,6 +1456,10 @@ def main():
         if not snap:
             time.sleep(LOOP_SLEEP)
             continue
+        if REQUIRE_FRESH_TICK:
+            current_case = get("/case")
+            if not current_case or current_case.get("status") != "ACTIVE" or current_case.get("tick") != tick:
+                continue  # quotes and books crossed a tick; rebuild before opening or accepting anything
         took = check_pending(snap, tick) or handle_tenders(snap, tick)
         if took:
             snap = snapshot_at(tick, ticks) or snap
@@ -1384,6 +1476,7 @@ def main():
         if arb(snap, tick):
             hedge(snap, tick, passive=False)
         if first_of_tick:
+            conversion_opportunity(snap, tick)
             mm(snap, tick, get("/orders", status="OPEN"))   # None if the call failed (not [])
             fx_hedge(snap)
 
